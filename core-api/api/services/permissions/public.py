@@ -55,7 +55,7 @@ async def _get_share_link_row(client: Any, token: str) -> Optional[Dict[str, Any
             client.table("permissions")
             .select("resource_type, resource_id, permission, granted_by, expires_at")
             .eq("grantee_type", "link")
-            .ilike("link_slug", token)
+            .eq("link_slug", token.lower())
             .limit(1)
             .execute()
         )

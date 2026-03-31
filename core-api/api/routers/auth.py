@@ -273,6 +273,7 @@ class UpdateEmailAccountRequest(BaseModel):
 async def create_user(
     user: UserCreate,
     current_user_id: Annotated[str, Depends(get_current_user_id)],
+    current_user_email: Annotated[str, Depends(get_current_user_email)],
     user_jwt: Annotated[str, Depends(get_current_user_jwt)],
 ):
     """
@@ -287,6 +288,13 @@ async def create_user(
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Cannot create user for a different user ID"
+        )
+
+    # Validate email matches JWT claim to prevent spoofed profile rows
+    if str(user.email).strip().lower() != current_user_email:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Cannot create user with a different email"
         )
 
     try:
