@@ -7,7 +7,7 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, EmailStr, Field
 
-from api.dependencies import get_current_user_id, get_current_user_jwt
+from api.dependencies import get_current_user_email, get_current_user_id, get_current_user_jwt
 from api.exceptions import handle_api_exception
 from api.services.workspaces.invitations import (
     create_or_refresh_workspace_invitation,
@@ -124,10 +124,15 @@ async def list_invitations_endpoint(
 async def accept_invitation_endpoint(
     invitation_id: str,
     user_id: str = Depends(get_current_user_id),
+    user_email: str = Depends(get_current_user_email),
 ):
     """Accept an invitation by id."""
     try:
-        result = await accept_workspace_invitation(invitation_id=invitation_id, user_id=user_id)
+        result = await accept_workspace_invitation(
+            invitation_id=invitation_id,
+            user_id=user_id,
+            user_email=user_email,
+        )
         return result
     except HTTPException:
         raise
@@ -139,10 +144,15 @@ async def accept_invitation_endpoint(
 async def decline_invitation_endpoint(
     invitation_id: str,
     user_id: str = Depends(get_current_user_id),
+    user_email: str = Depends(get_current_user_email),
 ):
     """Decline an invitation by id."""
     try:
-        result = await decline_workspace_invitation(invitation_id=invitation_id, user_id=user_id)
+        result = await decline_workspace_invitation(
+            invitation_id=invitation_id,
+            user_id=user_id,
+            user_email=user_email,
+        )
         return result
     except HTTPException:
         raise
@@ -193,10 +203,15 @@ async def get_invitation_share_link_endpoint(
 async def accept_by_token_endpoint(
     request: AcceptByTokenRequest,
     user_id: str = Depends(get_current_user_id),
+    user_email: str = Depends(get_current_user_email),
 ):
     """Accept an invitation by token (auth required)."""
     try:
-        result = await accept_workspace_invitation_by_token(token=request.token, user_id=user_id)
+        result = await accept_workspace_invitation_by_token(
+            token=request.token,
+            user_id=user_id,
+            user_email=user_email,
+        )
         return result
     except HTTPException:
         raise

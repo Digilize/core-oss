@@ -6,7 +6,7 @@ from pydantic import BaseModel, EmailStr
 from typing import Optional, List, Dict, Any
 from api.services.auth import AuthService
 from api.services.workspaces.invitations import resolve_post_signup_pending_invitations
-from api.dependencies import get_current_user_jwt, get_current_user_id
+from api.dependencies import get_current_user_email, get_current_user_jwt, get_current_user_id
 from api.exceptions import handle_api_exception
 from api.schemas import MessageResponse
 from api.config import settings
@@ -271,7 +271,8 @@ class UpdateEmailAccountRequest(BaseModel):
 @router.post("/users", response_model=UserCreateResponse, status_code=status.HTTP_201_CREATED)
 async def create_user(
     user: UserCreate,
-    current_user_id: str = Depends(get_current_user_id)
+    current_user_id: str = Depends(get_current_user_id),
+    user_jwt: str = Depends(get_current_user_jwt),
 ):
     """
     Create a new user in the database.
@@ -288,7 +289,7 @@ async def create_user(
         )
 
     try:
-        return AuthService.create_user(user.model_dump())
+        return AuthService.create_user(user.model_dump(), user_jwt)
     except Exception as e:
         handle_api_exception(e, "Failed to create user", logger)
 
@@ -456,6 +457,7 @@ async def complete_oauth_flow(
 @router.post("/post-signup", response_model=PostSignupResponse)
 async def post_signup_endpoint(
     current_user_id: str = Depends(get_current_user_id),
+    current_user_email: str = Depends(get_current_user_email),
 ):
     """
     Resolve pending workspace invitations after authentication bootstrap.
@@ -464,7 +466,7 @@ async def post_signup_endpoint(
     both materialize invitation notifications for existing pending invites.
     """
     try:
-        return await resolve_post_signup_pending_invitations(current_user_id)
+        return await resolve_post_signup_pending_invitations(current_user_id, current_user_email)
     except HTTPException:
         raise
     except Exception as e:

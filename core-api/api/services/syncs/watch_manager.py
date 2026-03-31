@@ -590,7 +590,15 @@ def start_gmail_watch_service_role(
                 }
 
             logger.info(f"🔄 Gmail watch expiring soon for user {user_id[:8]}..., renewing")
-            # Deactivate old watch
+            # Stop the old watch with Gmail first to prevent duplicate notifications
+            try:
+                gmail_service.users().stop(userId='me').execute()
+                logger.info(f"🛑 Stopped old Gmail watch before renewal for user {user_id[:8]}...")
+            except HttpError as e:
+                logger.warning(f"⚠️ Could not stop old Gmail watch (may already be expired): {e}")
+            except Exception as e:
+                logger.warning(f"⚠️ Could not stop old Gmail watch: {e}")
+            # Deactivate old watch in DB
             service_supabase.table('push_subscriptions')\
                 .update({'is_active': False})\
                 .eq('id', existing.data[0]['id'])\
