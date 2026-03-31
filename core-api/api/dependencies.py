@@ -157,7 +157,7 @@ async def get_current_user_id(
     return user_id
 
 
-async def get_current_user_email(
+def get_current_user_email(
     token_and_payload: Tuple[str, Dict[str, Any]] = Depends(get_validated_token_and_payload)
 ) -> str:
     """

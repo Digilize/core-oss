@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
@@ -56,6 +57,7 @@ class FakeSupabaseQuery:
         return True
 
     async def execute(self) -> FakeResponse:
+        await asyncio.sleep(0)
         rows = [dict(row) for row in self._rows() if self._matches(row)]
         if self._limit is not None:
             rows = rows[: self._limit]
@@ -77,6 +79,7 @@ class FakeRpcResult:
         self._payload = payload
 
     async def execute(self) -> FakeResponse:
+        await asyncio.sleep(0)
         return FakeResponse(self._payload)
 
 

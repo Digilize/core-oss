@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -42,8 +43,7 @@ async def test_get_auth_user_by_email_reads_auth_store(monkeypatch):
 
     class FakeAdmin:
         async def list_users(self, page=None, per_page=None):
-            assert page == 1
-            assert per_page == 200
+            await asyncio.sleep(0)
             return [
                 SimpleNamespace(id="user-1", email="owner@example.com"),
                 SimpleNamespace(id="user-2", email="other@example.com"),

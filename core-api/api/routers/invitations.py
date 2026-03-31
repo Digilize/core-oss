@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Annotated, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, EmailStr, Field
@@ -123,8 +123,8 @@ async def list_invitations_endpoint(
 @router.post("/invitations/{invitation_id}/accept", response_model=InvitationActionResponse)
 async def accept_invitation_endpoint(
     invitation_id: str,
-    user_id: str = Depends(get_current_user_id),
-    user_email: str = Depends(get_current_user_email),
+    user_id: Annotated[str, Depends(get_current_user_id)],
+    user_email: Annotated[str, Depends(get_current_user_email)],
 ):
     """Accept an invitation by id."""
     try:
@@ -143,8 +143,8 @@ async def accept_invitation_endpoint(
 @router.post("/invitations/{invitation_id}/decline", response_model=InvitationActionResponse)
 async def decline_invitation_endpoint(
     invitation_id: str,
-    user_id: str = Depends(get_current_user_id),
-    user_email: str = Depends(get_current_user_email),
+    user_id: Annotated[str, Depends(get_current_user_id)],
+    user_email: Annotated[str, Depends(get_current_user_email)],
 ):
     """Decline an invitation by id."""
     try:
@@ -202,8 +202,8 @@ async def get_invitation_share_link_endpoint(
 @router.post("/invitations/accept-by-token", response_model=InvitationActionResponse)
 async def accept_by_token_endpoint(
     request: AcceptByTokenRequest,
-    user_id: str = Depends(get_current_user_id),
-    user_email: str = Depends(get_current_user_email),
+    user_id: Annotated[str, Depends(get_current_user_id)],
+    user_email: Annotated[str, Depends(get_current_user_email)],
 ):
     """Accept an invitation by token (auth required)."""
     try:

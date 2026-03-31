@@ -11,6 +11,8 @@ from api.services.users import attach_public_profiles
 
 logger = logging.getLogger(__name__)
 
+_MESSAGE_SELECT = "*, agent:agent_instances(id, name, avatar_url), reactions:message_reactions(*)"
+
 
 def extract_plain_text(blocks: List[Dict[str, Any]]) -> str:
     """
@@ -69,7 +71,7 @@ async def get_messages(
     try:
         query = (
             supabase.table("channel_messages")
-            .select("*, agent:agent_instances(id, name, avatar_url), reactions:message_reactions(*)")
+            .select(_MESSAGE_SELECT)
             .eq("channel_id", channel_id)
         )
 
@@ -141,7 +143,7 @@ async def get_message(
     try:
         result = await (
             supabase.table("channel_messages")
-            .select("*, agent:agent_instances(id, name, avatar_url), reactions:message_reactions(*)")
+            .select(_MESSAGE_SELECT)
             .eq("id", message_id)
             .limit(1)
             .execute()
@@ -412,7 +414,7 @@ async def get_thread_replies(
     try:
         result = await (
             supabase.table("channel_messages")
-            .select("*, agent:agent_instances(id, name, avatar_url), reactions:message_reactions(*)")
+            .select(_MESSAGE_SELECT)
             .eq("thread_parent_id", parent_message_id)
             .order("created_at")
             .range(offset, offset + limit - 1)

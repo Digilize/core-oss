@@ -189,6 +189,23 @@ async def attach_public_profiles(
         row[target_field] = user_map.get(user_id, {"id": user_id})
 
 
+async def _find_auth_user_by_email(auth_admin: Any, normalized_email: str) -> Any:
+    """Paginate through auth users to find an exact email match."""
+    page = 1
+    while True:
+        users = await auth_admin.list_users(page=page, per_page=_AUTH_USER_PAGE_SIZE)
+        if not users:
+            return None
+
+        for user in users:
+            if (getattr(user, "email", None) or "").strip().lower() == normalized_email:
+                return user
+
+        if len(users) < _AUTH_USER_PAGE_SIZE:
+            return None
+        page += 1
+
+
 async def get_auth_user_by_email(
     email: str,
 ) -> Optional[Dict[str, Any]]:
@@ -208,22 +225,7 @@ async def get_auth_user_by_email(
         if auth_admin is None:
             return await get_user_by_email(normalized_email)
 
-        page = 1
-        matched_user = None
-        while True:
-            users = await auth_admin.list_users(page=page, per_page=_AUTH_USER_PAGE_SIZE)
-            if not users:
-                break
-
-            for user in users:
-                if (getattr(user, "email", None) or "").strip().lower() == normalized_email:
-                    matched_user = user
-                    break
-
-            if matched_user is not None or len(users) < _AUTH_USER_PAGE_SIZE:
-                break
-            page += 1
-
+        matched_user = await _find_auth_user_by_email(auth_admin, normalized_email)
         if matched_user is None:
             return None
 

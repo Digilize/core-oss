@@ -1,9 +1,10 @@
 """
 Authentication router - HTTP endpoints for auth operations
 """
-from fastapi import APIRouter, HTTPException, Request, Response, status, Depends
+from typing import Annotated, Optional, List, Dict, Any
+
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel, EmailStr
-from typing import Optional, List, Dict, Any
 from api.services.auth import AuthService
 from api.services.workspaces.invitations import resolve_post_signup_pending_invitations
 from api.dependencies import get_current_user_email, get_current_user_jwt, get_current_user_id
@@ -271,8 +272,8 @@ class UpdateEmailAccountRequest(BaseModel):
 @router.post("/users", response_model=UserCreateResponse, status_code=status.HTTP_201_CREATED)
 async def create_user(
     user: UserCreate,
-    current_user_id: str = Depends(get_current_user_id),
-    user_jwt: str = Depends(get_current_user_jwt),
+    current_user_id: Annotated[str, Depends(get_current_user_id)],
+    user_jwt: Annotated[str, Depends(get_current_user_jwt)],
 ):
     """
     Create a new user in the database.
@@ -456,8 +457,8 @@ async def complete_oauth_flow(
 
 @router.post("/post-signup", response_model=PostSignupResponse)
 async def post_signup_endpoint(
-    current_user_id: str = Depends(get_current_user_id),
-    current_user_email: str = Depends(get_current_user_email),
+    current_user_id: Annotated[str, Depends(get_current_user_id)],
+    current_user_email: Annotated[str, Depends(get_current_user_email)],
 ):
     """
     Resolve pending workspace invitations after authentication bootstrap.
