@@ -35,8 +35,7 @@ class FakeSupabaseQuery:
         return self
 
     def ilike(self, field: str, value: Any) -> "FakeSupabaseQuery":
-        self._filters.append(("ilike", field, value))
-        return self
+        raise AssertionError(f"ilike() should not be used — use eq() to avoid wildcard injection (field={field})")
 
     def limit(self, value: int) -> "FakeSupabaseQuery":
         self._limit = value
