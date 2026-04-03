@@ -4,11 +4,13 @@ User profile router - endpoints for user profile management including avatar upl
 from fastapi import APIRouter, HTTPException, status, Depends
 from pydantic import BaseModel, Field
 from typing import Optional
-from api.dependencies import get_current_user_jwt, get_current_user_id
+import asyncpg
+
+from api.dependencies import get_current_user_id
 from api.exceptions import handle_api_exception
 from api.config import settings
 from lib.r2_client import get_r2_client
-from lib.supabase_client import get_service_role_client
+from lib.db import get_admin_db_conn
 import logging
 
 logger = logging.getLogger(__name__)
@@ -68,22 +70,24 @@ class UserProfileResponse(BaseModel):
 @router.get("/me", response_model=UserProfileResponse)
 async def get_current_user_profile(
     current_user_id: str = Depends(get_current_user_id),
-    user_jwt: str = Depends(get_current_user_jwt)
 ):
     """
     Get current user's profile.
     """
     try:
-        supabase = get_service_role_client()
-        result = supabase.table("users").select("*").eq("id", current_user_id).maybe_single().execute()
+        async with get_admin_db_conn() as conn:
+            row = await conn.fetchrow(
+                "SELECT id, email, name, avatar_url, onboarding_completed_at FROM users WHERE id = $1",
+                current_user_id,
+            )
 
-        if not result.data:
+        if not row:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="User not found"
             )
 
-        return result.data
+        return dict(row)
     except HTTPException:
         raise
     except Exception as e:
@@ -99,7 +103,7 @@ async def update_current_user_profile(
     Update current user's profile (name, onboarding status).
     """
     try:
-        updates = {}
+        updates: dict = {}
         if request.name is not None:
             updates["name"] = request.name
         if request.onboarding_completed_at is not None:
@@ -111,16 +115,28 @@ async def update_current_user_profile(
                 detail="No fields to update"
             )
 
-        supabase = get_service_role_client()
-        result = supabase.table("users").update(updates).eq("id", current_user_id).execute()
+        # Build SET clause dynamically with $2, $3, ... for each field
+        set_parts = []
+        values = []
+        for i, (col, val) in enumerate(updates.items(), start=2):
+            set_parts.append(f"{col} = ${i}")
+            values.append(val)
 
-        if not result.data:
+        sql = (
+            f"UPDATE users SET {', '.join(set_parts)} WHERE id = $1 "
+            "RETURNING id, email, name, avatar_url, onboarding_completed_at"
+        )
+
+        async with get_admin_db_conn() as conn:
+            row = await conn.fetchrow(sql, current_user_id, *values)
+
+        if not row:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="User not found"
             )
 
-        return result.data[0]
+        return dict(row)
     except HTTPException:
         raise
     except Exception as e:
@@ -173,7 +189,7 @@ async def initiate_avatar_upload(
         # Build public URL (using public r2.dev URL for avatars)
         public_url = f"{settings.r2_public_access_url}/{r2_key}" if settings.r2_public_access_url else ""
 
-        logger.info(f"📤 Initiated avatar upload for user {current_user_id}")
+        logger.info(f"Initiated avatar upload for user {current_user_id}")
 
         return AvatarUploadInitiateResponse(
             upload_url=presigned["url"],
@@ -217,18 +233,20 @@ async def confirm_avatar_upload(
         public_url = f"{settings.r2_public_access_url}/{request.r2_key}"
 
         # Update user's avatar_url in database
-        supabase = get_service_role_client()
-        result = supabase.table("users").update({
-            "avatar_url": public_url
-        }).eq("id", current_user_id).execute()
+        async with get_admin_db_conn() as conn:
+            row = await conn.fetchrow(
+                "UPDATE users SET avatar_url = $1 WHERE id = $2 RETURNING id",
+                public_url,
+                current_user_id,
+            )
 
-        if not result.data:
+        if not row:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="User not found"
             )
 
-        logger.info(f"✅ Avatar updated for user {current_user_id}: {public_url}")
+        logger.info(f"Avatar updated for user {current_user_id}: {public_url}")
 
         return AvatarUploadConfirmResponse(avatar_url=public_url)
 
@@ -246,37 +264,42 @@ async def delete_avatar(
     Remove user's avatar, reverting to default.
     """
     try:
-        supabase = get_service_role_client()
-
-        # Get current avatar URL to delete from R2
-        user_result = supabase.table("users").select("avatar_url").eq("id", current_user_id).maybe_single().execute()
-
-        if not user_result.data:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="User not found"
+        async with get_admin_db_conn() as conn:
+            # Get current avatar URL to delete from R2
+            user_row = await conn.fetchrow(
+                "SELECT avatar_url FROM users WHERE id = $1",
+                current_user_id,
             )
 
-        if user_result.data.get("avatar_url"):
-            old_url = user_result.data["avatar_url"]
-            # Extract r2_key from URL
-            if settings.r2_public_access_url and old_url.startswith(settings.r2_public_access_url):
-                r2_key = old_url.replace(f"{settings.r2_public_access_url}/", "")
-                try:
-                    r2 = get_r2_client()
-                    r2.delete_file(r2_key, bucket=settings.r2_public_bucket)
-                    logger.info(f"🗑️ Deleted old avatar from R2: {r2_key}")
-                except Exception as e:
-                    logger.warning(f"Failed to delete old avatar from R2: {e}")
+            if not user_row:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="User not found"
+                )
 
-        # Clear avatar_url in database
-        supabase.table("users").update({
-            "avatar_url": None
-        }).eq("id", current_user_id).execute()
+            if user_row["avatar_url"]:
+                old_url = user_row["avatar_url"]
+                # Extract r2_key from URL and delete from R2
+                if settings.r2_public_access_url and old_url.startswith(settings.r2_public_access_url):
+                    r2_key = old_url.replace(f"{settings.r2_public_access_url}/", "")
+                    try:
+                        r2 = get_r2_client()
+                        r2.delete_file(r2_key, bucket=settings.r2_public_bucket)
+                        logger.info(f"Deleted old avatar from R2: {r2_key}")
+                    except Exception as e:
+                        logger.warning(f"Failed to delete old avatar from R2: {e}")
 
-        logger.info(f"✅ Avatar removed for user {current_user_id}")
+            # Clear avatar_url in database
+            await conn.execute(
+                "UPDATE users SET avatar_url = NULL WHERE id = $1",
+                current_user_id,
+            )
+
+        logger.info(f"Avatar removed for user {current_user_id}")
 
         return AvatarUploadConfirmResponse(avatar_url="")
 
+    except HTTPException:
+        raise
     except Exception as e:
         handle_api_exception(e, "Failed to delete avatar", logger)

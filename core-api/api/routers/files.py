@@ -4,6 +4,7 @@ Files router - HTTP endpoints for file upload/download operations
 from fastapi import APIRouter, HTTPException, Request, status, Depends, UploadFile, File, Query, Response
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
+import asyncpg
 import logging
 import time
 
@@ -14,14 +15,13 @@ from api.services.files import (
     get_presigned_url,
     list_files,
 )
-from api.dependencies import get_current_user_jwt, get_current_user_id
+from api.dependencies import get_current_user_id, get_db
 from api.exceptions import handle_api_exception
 from api.config import settings
 from api.rate_limit import limiter
 from lib.filename_utils import sanitize_filename
 from lib.r2_client import get_r2_client
 from lib.image_proxy import generate_file_url, is_image_type, get_signed_url_expiration
-from lib.supabase_client import get_authenticated_supabase_client
 from lib.presigned_upload import (
     PresignedUploadManager,
     PresignedUploadError,
@@ -130,8 +130,8 @@ async def get_presigned_upload_url(
     request: Request,
     response: Response,
     body: PresignedUploadRequest,
-    user_jwt: str = Depends(get_current_user_jwt),
     user_id: str = Depends(get_current_user_id),
+    conn: asyncpg.Connection = Depends(get_db),
 ):
     """
     Get a presigned URL for direct upload to R2.
@@ -149,7 +149,7 @@ async def get_presigned_upload_url(
     """
     manager = PresignedUploadManager(
         r2_client=get_r2_client(),
-        supabase_client=get_authenticated_supabase_client(user_jwt),
+        conn=conn,
     )
 
     try:
@@ -162,7 +162,7 @@ async def get_presigned_upload_url(
 
         safe_filename = sanitize_filename(body.filename)
 
-        result = manager.initiate_upload(
+        result = await manager.initiate_upload(
             user_id=user_id,
             workspace_app_id=body.workspace_app_id,
             workspace_id=body.workspace_id,
@@ -174,7 +174,7 @@ async def get_presigned_upload_url(
             create_document=body.create_document,
         )
 
-        logger.info(f"📤 Presigned upload URL generated for user {user_id}: {result.file_id}")
+        logger.info(f"Presigned upload URL generated for user {user_id}: {result.file_id}")
 
         return PresignedUploadResponse(
             file_id=result.file_id,
@@ -205,8 +205,8 @@ async def get_presigned_upload_url(
 async def confirm_upload(
     file_id: str,
     request: Optional[ConfirmUploadRequest] = None,
-    user_jwt: str = Depends(get_current_user_jwt),
     user_id: str = Depends(get_current_user_id),
+    conn: asyncpg.Connection = Depends(get_db),
 ):
     """
     Confirm file was uploaded successfully to R2.
@@ -222,11 +222,11 @@ async def confirm_upload(
 
     manager = PresignedUploadManager(
         r2_client=get_r2_client(),
-        supabase_client=get_authenticated_supabase_client(user_jwt),
+        conn=conn,
     )
 
     try:
-        result = manager.confirm_upload(
+        result = await manager.confirm_upload(
             file_id=file_id,
             user_id=user_id,
             parent_id=request.parent_id,
@@ -234,7 +234,7 @@ async def confirm_upload(
             create_document=request.create_document,
         )
 
-        logger.info(f"✅ Upload confirmed for file {file_id}")
+        logger.info(f"Upload confirmed for file {file_id}")
 
         return ConfirmUploadResponse(
             file=result.file,
@@ -269,8 +269,8 @@ async def upload_file_endpoint(
     parent_id: Optional[str] = Query(None, description="Parent folder ID in documents tree"),
     create_document: bool = Query(True, description="Create a document entry for the file"),
     tags: Optional[List[str]] = Query(None, description="Tags to assign to the file (can be repeated)"),
-    user_jwt: str = Depends(get_current_user_jwt),
     user_id: str = Depends(get_current_user_id),
+    conn: asyncpg.Connection = Depends(get_db),
 ):
     """
     Upload a file to R2 storage.
@@ -279,8 +279,6 @@ async def upload_file_endpoint(
     - Metadata is stored in the database
     - Optionally creates a document entry for the file in the documents tree
     - Tags can be assigned during upload (e.g., ?tags=Work&tags=Important)
-
-    Requires: Authorization header with user's Supabase JWT
     """
     try:
         # Validate file size by reading in chunks (memory efficient)
@@ -308,11 +306,11 @@ async def upload_file_endpoint(
 
         safe_filename = sanitize_filename(file.filename or "unnamed")
 
-        logger.info(f"📤 Uploading file '{safe_filename}' ({file_size} bytes) for user {user_id}")
+        logger.info(f"Uploading file '{safe_filename}' ({file_size} bytes) for user {user_id}")
 
         result = await upload_file(
             user_id=user_id,
-            user_jwt=user_jwt,
+            conn=conn,
             workspace_app_id=workspace_app_id,
             file_data=file.file,
             filename=safe_filename,
@@ -323,7 +321,7 @@ async def upload_file_endpoint(
             tags=tags,
         )
 
-        logger.info(f"✅ File uploaded: {result['file']['id']}")
+        logger.info(f"File uploaded: {result['file']['id']}")
         return result
 
     except HTTPException:
@@ -341,8 +339,8 @@ async def upload_file_endpoint(
 @router.get("", response_model=FileListResponse)
 async def list_files_endpoint(
     response: Response,
-    user_jwt: str = Depends(get_current_user_jwt),
     user_id: str = Depends(get_current_user_id),
+    conn: asyncpg.Connection = Depends(get_db),
     workspace_id: Optional[str] = Query(None, description="Filter by workspace ID"),
     workspace_app_id: Optional[str] = Query(None, description="Filter by workspace app ID"),
     file_type: Optional[str] = Query(None, description="Filter by MIME type (e.g., 'image/png' or 'image/' for all images)"),
@@ -351,15 +349,13 @@ async def list_files_endpoint(
 ):
     """
     List files for a user with optional filtering.
-
-    Requires: Authorization header with user's Supabase JWT
     """
     try:
-        logger.info(f"📋 Listing files for user {user_id}")
+        logger.info(f"Listing files for user {user_id}")
 
         files = await list_files(
             user_id=user_id,
-            user_jwt=user_jwt,
+            conn=conn,
             workspace_id=workspace_id,
             workspace_app_id=workspace_app_id,
             file_type=file_type,
@@ -370,7 +366,7 @@ async def list_files_endpoint(
         # Add cache headers for edge caching
         response.headers["Cache-Control"] = "s-maxage=60, stale-while-revalidate=300"
 
-        logger.info(f"✅ Found {len(files)} files")
+        logger.info(f"Found {len(files)} files")
         return {"files": files, "count": len(files)}
 
     except Exception as e:
@@ -381,27 +377,25 @@ async def list_files_endpoint(
 async def get_file_endpoint(
     file_id: str,
     response: Response,
-    user_jwt: str = Depends(get_current_user_jwt),
     user_id: str = Depends(get_current_user_id),
+    conn: asyncpg.Connection = Depends(get_db),
 ):
     """
     Get file metadata by ID.
-
-    Requires: Authorization header with user's Supabase JWT
     """
     try:
-        logger.info(f"📄 Getting file {file_id} for user {user_id}")
+        logger.info(f"Getting file {file_id} for user {user_id}")
 
         file = await get_file(
             user_id=user_id,
-            user_jwt=user_jwt,
+            conn=conn,
             file_id=file_id,
         )
 
         # Add cache headers
         response.headers["Cache-Control"] = "s-maxage=300, stale-while-revalidate=600"
 
-        logger.info(f"✅ Found file: {file_id}")
+        logger.info(f"Found file: {file_id}")
         return file
 
     except Exception as e:
@@ -411,8 +405,8 @@ async def get_file_endpoint(
 @router.get("/{file_id}/url", response_model=FileURLResponse)
 async def get_file_url_endpoint(
     file_id: str,
-    user_jwt: str = Depends(get_current_user_jwt),
     user_id: str = Depends(get_current_user_id),
+    conn: asyncpg.Connection = Depends(get_db),
     expiration: int = Query(3600, ge=60, le=604800, description="URL expiration in seconds (1 min to 7 days)"),
 ):
     """
@@ -420,15 +414,13 @@ async def get_file_url_endpoint(
 
     The URL is temporary and expires after the specified time.
     Default expiration is 1 hour (3600 seconds).
-
-    Requires: Authorization header with user's Supabase JWT
     """
     try:
-        logger.info(f"🔗 Getting download URL for file {file_id}")
+        logger.info(f"Getting download URL for file {file_id}")
 
         result = await get_presigned_url(
             user_id=user_id,
-            user_jwt=user_jwt,
+            conn=conn,
             file_id=file_id,
             expiration=expiration,
         )
@@ -444,10 +436,10 @@ async def get_file_url_endpoint(
             if proxy_url:
                 # Match proxy URL signing window/validity.
                 expires_in = max(0, get_signed_url_expiration() - int(time.time()))
-                logger.info(f"✅ Generated proxy URL for: {file_id}")
+                logger.info(f"Generated proxy URL for: {file_id}")
                 return {"url": proxy_url, "expires_in": expires_in}
 
-        logger.info(f"✅ Generated presigned URL for: {file_id}")
+        logger.info(f"Generated presigned URL for: {file_id}")
         return result
 
     except Exception as e:
@@ -457,25 +449,23 @@ async def get_file_url_endpoint(
 @router.delete("/{file_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_file_endpoint(
     file_id: str,
-    user_jwt: str = Depends(get_current_user_jwt),
     user_id: str = Depends(get_current_user_id),
+    conn: asyncpg.Connection = Depends(get_db),
 ):
     """
     Delete a file from R2 and the database.
     Also removes any document entries that reference this file.
-
-    Requires: Authorization header with user's Supabase JWT
     """
     try:
-        logger.info(f"🗑️ Deleting file {file_id} for user {user_id}")
+        logger.info(f"Deleting file {file_id} for user {user_id}")
 
         await delete_file(
             user_id=user_id,
-            user_jwt=user_jwt,
+            conn=conn,
             file_id=file_id,
         )
 
-        logger.info(f"✅ Deleted file: {file_id}")
+        logger.info(f"Deleted file: {file_id}")
         return None
 
     except Exception as e:

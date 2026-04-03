@@ -4,8 +4,8 @@ User preferences router - HTTP endpoints for user settings
 from fastapi import APIRouter, HTTPException, status, Depends
 from pydantic import BaseModel
 from typing import Optional
-from api.dependencies import get_current_user_jwt, get_current_user_id
-from lib.supabase_client import get_authenticated_supabase_client
+import asyncpg
+from api.dependencies import get_current_user_id, get_db
 import logging
 
 logger = logging.getLogger(__name__)
@@ -36,44 +36,46 @@ class UpdatePreferencesRequest(BaseModel):
 
 @router.get("", response_model=UserPreferencesResponse)
 async def get_preferences(
-    user_jwt: str = Depends(get_current_user_jwt),
-    user_id: str = Depends(get_current_user_id)
+    user_id: str = Depends(get_current_user_id),
+    conn: asyncpg.Connection = Depends(get_db),
 ):
     """
     Get user preferences. Creates default preferences if none exist.
     """
     try:
-        supabase = get_authenticated_supabase_client(user_jwt)
+        row = await conn.fetchrow(
+            "SELECT * FROM user_preferences WHERE user_id = $1",
+            user_id,
+        )
 
-        # Try to get existing preferences
-        result = supabase.table("user_preferences").select("*").eq("user_id", user_id).execute()
-
-        if result.data and len(result.data) > 0:
-            prefs = result.data[0]
+        if row:
+            prefs = dict(row)
             return UserPreferencesResponse(
                 show_embedded_cards=prefs.get("show_embedded_cards", True),
                 always_search_content=prefs.get("always_search_content", True),
                 timezone=prefs.get("timezone", "UTC"),
             )
 
-        # No preferences exist, create defaults
-        default_prefs = {
-            "user_id": user_id,
-            "show_embedded_cards": True,
-            "always_search_content": True,
-            "timezone": "UTC",
-        }
+        # No preferences exist — create defaults
+        inserted = await conn.fetchrow(
+            """
+            INSERT INTO user_preferences (user_id, show_embedded_cards, always_search_content, timezone)
+            VALUES ($1, TRUE, TRUE, 'UTC')
+            ON CONFLICT (user_id) DO NOTHING
+            RETURNING *
+            """,
+            user_id,
+        )
 
-        insert_result = supabase.table("user_preferences").insert(default_prefs).execute()
-
-        if insert_result.data and len(insert_result.data) > 0:
+        if inserted:
+            prefs = dict(inserted)
             return UserPreferencesResponse(
-                show_embedded_cards=insert_result.data[0].get("show_embedded_cards", True),
-                always_search_content=insert_result.data[0].get("always_search_content", True),
-                timezone=insert_result.data[0].get("timezone", "UTC"),
+                show_embedded_cards=prefs.get("show_embedded_cards", True),
+                always_search_content=prefs.get("always_search_content", True),
+                timezone=prefs.get("timezone", "UTC"),
             )
 
-        # Return defaults if insert failed (shouldn't happen)
+        # Return defaults if insert returned nothing (race condition — row now exists)
         return UserPreferencesResponse()
 
     except Exception as e:
@@ -85,17 +87,15 @@ async def get_preferences(
 @router.patch("", response_model=UserPreferencesResponse)
 async def update_preferences(
     updates: UpdatePreferencesRequest,
-    user_jwt: str = Depends(get_current_user_jwt),
-    user_id: str = Depends(get_current_user_id)
+    user_id: str = Depends(get_current_user_id),
+    conn: asyncpg.Connection = Depends(get_db),
 ):
     """
     Update user preferences. Creates preferences row if none exist.
     """
     try:
-        supabase = get_authenticated_supabase_client(user_jwt)
-
         # Build update dict with only provided fields
-        update_data = {}
+        update_data: dict = {}
         if updates.show_embedded_cards is not None:
             update_data["show_embedded_cards"] = updates.show_embedded_cards
         if updates.always_search_content is not None:
@@ -104,22 +104,54 @@ async def update_preferences(
             update_data["timezone"] = updates.timezone
 
         if not update_data:
-            # No updates provided, just return current preferences
-            return await get_preferences(user_jwt, user_id)
+            # No updates provided — return current preferences
+            return await get_preferences(user_id=user_id, conn=conn)
 
-        # Check if preferences exist
-        existing = supabase.table("user_preferences").select("id").eq("user_id", user_id).execute()
+        # Upsert: update if exists, insert with defaults merged with updates otherwise
+        set_clauses = []
+        params: list = []
 
-        if existing.data and len(existing.data) > 0:
-            # Update existing
-            result = supabase.table("user_preferences").update(update_data).eq("user_id", user_id).execute()
-        else:
-            # Insert new with updates
-            update_data["user_id"] = user_id
-            result = supabase.table("user_preferences").insert(update_data).execute()
+        def _p(val) -> str:
+            params.append(val)
+            return f"${len(params)}"
 
-        if result.data and len(result.data) > 0:
-            prefs = result.data[0]
+        for col, val in update_data.items():
+            set_clauses.append(f"{col} = {_p(val)}")
+
+        params.append(user_id)
+        user_id_placeholder = f"${len(params)}"
+
+        # Build an upsert: insert defaults + updates, on conflict update only the changed cols
+        insert_cols = ["user_id", "show_embedded_cards", "always_search_content", "timezone"]
+        insert_defaults = {
+            "show_embedded_cards": update_data.get("show_embedded_cards", True),
+            "always_search_content": update_data.get("always_search_content", True),
+            "timezone": update_data.get("timezone", "UTC"),
+        }
+
+        insert_params: list = [user_id]
+        insert_placeholders = ["$1"]
+        for col in ["show_embedded_cards", "always_search_content", "timezone"]:
+            insert_params.append(insert_defaults[col])
+            insert_placeholders.append(f"${len(insert_params)}")
+
+        update_set_parts = []
+        for col in update_data:
+            insert_params.append(update_data[col])
+            update_set_parts.append(f"{col} = ${len(insert_params)}")
+
+        sql = f"""
+            INSERT INTO user_preferences (user_id, show_embedded_cards, always_search_content, timezone)
+            VALUES ({', '.join(insert_placeholders)})
+            ON CONFLICT (user_id) DO UPDATE
+            SET {', '.join(update_set_parts)}
+            RETURNING *
+        """
+
+        row = await conn.fetchrow(sql, *insert_params)
+
+        if row:
+            prefs = dict(row)
             return UserPreferencesResponse(
                 show_embedded_cards=prefs.get("show_embedded_cards", True),
                 always_search_content=prefs.get("always_search_content", True),

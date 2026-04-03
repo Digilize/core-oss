@@ -13,13 +13,14 @@ import sentry_sdk
 import time
 import logging
 import traceback
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from datetime import datetime
 from api.config import settings
 from api.schemas import HealthResponse, StatusResponse
-from lib.supabase_client import start_supabase_request_scope, reset_supabase_request_scope
+from lib.db import init_pool, close_pool
 
 logger = logging.getLogger(__name__)
 
@@ -47,12 +48,27 @@ from api.rate_limit import limiter
 
 from api.routers import auth, calendar, email, webhooks, cron, sync, documents, files, chat, chat_attachments, app_drawer, preferences, workspaces, invitations, messages, users, projects, notifications, init, agents, agent_dispatch, permissions, public, workers, builder
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Initialize and teardown application resources."""
+    # Initialize asyncpg connection pool on startup
+    if settings.neon_database_url:
+        await init_pool(settings.neon_database_url)
+    else:
+        logger.warning("[startup] NEON_DATABASE_URL not set — DB pool not initialized")
+    yield
+    # Clean up pool on shutdown
+    await close_pool()
+
+
 # Create FastAPI app - Vercel will auto-detect this
 app = FastAPI(
     title=settings.app_name,
     description="FastAPI backend for the all-in-one productivity app",
     version=settings.app_version,
-    debug=settings.debug
+    debug=settings.debug,
+    lifespan=lifespan,
 )
 
 # Rate limiting — middleware runs BEFORE FastAPI validation/dependencies
@@ -102,16 +118,6 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
-
-
-# Security headers middleware
-@app.middleware("http")
-async def supabase_request_scope_middleware(request: Request, call_next):
-    scope_token = start_supabase_request_scope()
-    try:
-        return await call_next(request)
-    finally:
-        reset_supabase_request_scope(scope_token)
 
 
 @app.middleware("http")

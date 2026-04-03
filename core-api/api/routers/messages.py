@@ -13,8 +13,9 @@ from fastapi import APIRouter, HTTPException, Depends, Query, Request, Response
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
 import logging
+import asyncpg
 
-from api.dependencies import get_current_user_id, get_current_user_jwt
+from api.dependencies import get_current_user_id, get_db
 from api.rate_limit import limiter
 from api.services.messages import (
     # Channels
@@ -236,11 +237,11 @@ class SuccessResponse(BaseModel):
 @router.get("/workspaces/apps/{workspace_app_id}/channels", response_model=ChannelListResponse)
 async def list_channels(
     workspace_app_id: str,
-    user_jwt: str = Depends(get_current_user_jwt),
+    conn: asyncpg.Connection = Depends(get_db),
 ):
     """Get all channels in a workspace app."""
     try:
-        channels = await get_channels(workspace_app_id, user_jwt)
+        channels = await get_channels(workspace_app_id, conn)
         return {"channels": channels, "count": len(channels)}
     except Exception as e:
         logger.error(f"Error listing channels: {e}")
@@ -255,14 +256,14 @@ async def create_new_channel(
     workspace_app_id: str,
     body: CreateChannelRequest,
     user_id: str = Depends(get_current_user_id),
-    user_jwt: str = Depends(get_current_user_jwt),
+    conn: asyncpg.Connection = Depends(get_db),
 ):
     """Create a new channel in a workspace app."""
     try:
         channel = await create_channel(
             workspace_app_id=workspace_app_id,
             user_id=user_id,
-            user_jwt=user_jwt,
+            conn=conn,
             name=body.name,
             description=body.description,
             is_private=body.is_private,
@@ -278,11 +279,11 @@ async def create_new_channel(
 @router.get("/channels/{channel_id}", response_model=SingleChannelResponse)
 async def get_channel_by_id(
     channel_id: str,
-    user_jwt: str = Depends(get_current_user_jwt),
+    conn: asyncpg.Connection = Depends(get_db),
 ):
     """Get a channel by ID."""
     try:
-        channel = await get_channel(channel_id, user_jwt)
+        channel = await get_channel(channel_id, conn)
         if not channel:
             raise HTTPException(status_code=404, detail="Channel not found")
         return {"channel": channel}
@@ -297,13 +298,13 @@ async def get_channel_by_id(
 async def update_channel_by_id(
     channel_id: str,
     request: UpdateChannelRequest,
-    user_jwt: str = Depends(get_current_user_jwt),
+    conn: asyncpg.Connection = Depends(get_db),
 ):
     """Update a channel."""
     try:
         channel = await update_channel(
             channel_id=channel_id,
-            user_jwt=user_jwt,
+            conn=conn,
             name=request.name,
             description=request.description,
         )
@@ -316,11 +317,11 @@ async def update_channel_by_id(
 @router.delete("/channels/{channel_id}", response_model=SuccessResponse)
 async def delete_channel_by_id(
     channel_id: str,
-    user_jwt: str = Depends(get_current_user_jwt),
+    conn: asyncpg.Connection = Depends(get_db),
 ):
     """Delete a channel."""
     try:
-        await delete_channel(channel_id, user_jwt)
+        await delete_channel(channel_id, conn)
         return {"success": True}
     except Exception as e:
         logger.error(f"Error deleting channel: {e}")
@@ -334,11 +335,11 @@ async def delete_channel_by_id(
 @router.get("/channels/{channel_id}/members", response_model=ChannelMemberListResponse)
 async def list_channel_members(
     channel_id: str,
-    user_jwt: str = Depends(get_current_user_jwt),
+    conn: asyncpg.Connection = Depends(get_db),
 ):
     """Get members of a channel."""
     try:
-        members = await get_channel_members(channel_id, user_jwt)
+        members = await get_channel_members(channel_id, conn)
         return {"members": members, "count": len(members)}
     except Exception as e:
         logger.error(f"Error listing channel members: {e}")
@@ -349,14 +350,14 @@ async def list_channel_members(
 async def add_member_to_channel(
     channel_id: str,
     request: AddChannelMemberRequest,
-    user_jwt: str = Depends(get_current_user_jwt),
+    conn: asyncpg.Connection = Depends(get_db),
 ):
     """Add a member to a private channel."""
     try:
         member = await add_channel_member(
             channel_id=channel_id,
             member_user_id=request.user_id,
-            user_jwt=user_jwt,
+            conn=conn,
             role=request.role,
         )
         return {"member": member}
@@ -373,11 +374,11 @@ async def add_member_to_channel(
 async def remove_member_from_channel(
     channel_id: str,
     user_id: str,
-    user_jwt: str = Depends(get_current_user_jwt),
+    conn: asyncpg.Connection = Depends(get_db),
 ):
     """Remove a member from a private channel."""
     try:
-        await remove_channel_member(channel_id, user_id, user_jwt)
+        await remove_channel_member(channel_id, user_id, conn)
         return {"success": True}
     except Exception as e:
         logger.error(f"Error removing channel member: {e}")
@@ -392,11 +393,11 @@ async def remove_member_from_channel(
 async def list_user_dms(
     workspace_app_id: str,
     user_id: str = Depends(get_current_user_id),
-    user_jwt: str = Depends(get_current_user_jwt),
+    conn: asyncpg.Connection = Depends(get_db),
 ):
     """Get all DM channels for the current user in a workspace app."""
     try:
-        dms = await get_user_dms(workspace_app_id, user_id, user_jwt)
+        dms = await get_user_dms(workspace_app_id, user_id, conn)
         return {"dms": dms, "count": len(dms)}
     except Exception as e:
         logger.error(f"Error listing DMs: {e}")
@@ -411,14 +412,14 @@ async def create_or_get_dm(
     workspace_app_id: str,
     body: CreateDMRequest,
     user_id: str = Depends(get_current_user_id),
-    user_jwt: str = Depends(get_current_user_jwt),
+    conn: asyncpg.Connection = Depends(get_db),
 ):
     """Get or create a DM channel with specified participants."""
     try:
         dm = await get_or_create_dm(
             workspace_app_id=workspace_app_id,
             user_id=user_id,
-            user_jwt=user_jwt,
+            conn=conn,
             participant_ids=body.participant_ids,
         )
         return {"dm": dm}
@@ -434,11 +435,11 @@ async def create_or_get_dm(
 @router.get("/workspaces/apps/{workspace_app_id}/unread-counts", response_model=UnreadCountsResponse)
 async def get_workspace_unread_counts(
     workspace_app_id: str,
-    user_jwt: str = Depends(get_current_user_jwt),
+    conn: asyncpg.Connection = Depends(get_db),
 ):
     """Get unread message counts for all channels in a workspace app."""
     try:
-        counts = await get_unread_counts(workspace_app_id, user_jwt)
+        counts = await get_unread_counts(workspace_app_id, conn)
         return {"unread_counts": counts}
     except Exception as e:
         logger.error(f"Error getting unread counts: {e}")
@@ -448,11 +449,11 @@ async def get_workspace_unread_counts(
 @router.post("/channels/{channel_id}/read", response_model=SuccessResponse)
 async def mark_channel_as_read(
     channel_id: str,
-    user_jwt: str = Depends(get_current_user_jwt),
+    conn: asyncpg.Connection = Depends(get_db),
 ):
     """Mark a channel as read for the current user."""
     try:
-        await mark_channel_read(channel_id, user_jwt)
+        await mark_channel_read(channel_id, conn)
         return {"success": True}
     except Exception as e:
         logger.error(f"Error marking channel read: {e}")
@@ -469,13 +470,13 @@ async def list_messages(
     limit: int = Query(50, ge=1, le=100),
     offset: int = Query(0, ge=0),
     before_id: Optional[str] = None,
-    user_jwt: str = Depends(get_current_user_jwt),
+    conn: asyncpg.Connection = Depends(get_db),
 ):
     """Get messages from a channel."""
     try:
         messages = await get_messages(
             channel_id=channel_id,
-            user_jwt=user_jwt,
+            conn=conn,
             limit=limit + 1,
             offset=offset,
             before_id=before_id,
@@ -497,7 +498,7 @@ async def send_message(
     channel_id: str,
     body: CreateMessageRequest,
     user_id: str = Depends(get_current_user_id),
-    user_jwt: str = Depends(get_current_user_jwt),
+    conn: asyncpg.Connection = Depends(get_db),
 ):
     """Send a message to a channel."""
     try:
@@ -507,7 +508,7 @@ async def send_message(
         message = await create_message(
             channel_id=channel_id,
             user_id=user_id,
-            user_jwt=user_jwt,
+            conn=conn,
             blocks=blocks,
             thread_parent_id=body.thread_parent_id,
         )
@@ -520,11 +521,11 @@ async def send_message(
 @router.get("/messages/{message_id}", response_model=SingleMessageResponse)
 async def get_message_by_id(
     message_id: str,
-    user_jwt: str = Depends(get_current_user_jwt),
+    conn: asyncpg.Connection = Depends(get_db),
 ):
     """Get a message by ID."""
     try:
-        message = await get_message(message_id, user_jwt)
+        message = await get_message(message_id, conn)
         if not message:
             raise HTTPException(status_code=404, detail="Message not found")
         return {"message": message}
@@ -539,12 +540,12 @@ async def get_message_by_id(
 async def edit_message(
     message_id: str,
     request: UpdateMessageRequest,
-    user_jwt: str = Depends(get_current_user_jwt),
+    conn: asyncpg.Connection = Depends(get_db),
 ):
     """Edit a message."""
     try:
         blocks = [block.model_dump() for block in request.blocks]
-        message = await update_message(message_id, user_jwt, blocks)
+        message = await update_message(message_id, conn, blocks)
         return {"message": message}
     except Exception as e:
         logger.error(f"Error editing message: {e}")
@@ -554,11 +555,11 @@ async def edit_message(
 @router.delete("/messages/{message_id}", response_model=SuccessResponse)
 async def delete_message_by_id(
     message_id: str,
-    user_jwt: str = Depends(get_current_user_jwt),
+    conn: asyncpg.Connection = Depends(get_db),
 ):
     """Delete a message."""
     try:
-        await delete_message(message_id, user_jwt)
+        await delete_message(message_id, conn)
         return {"success": True}
     except Exception as e:
         logger.error(f"Error deleting message: {e}")
@@ -574,13 +575,13 @@ async def list_thread_replies(
     message_id: str,
     limit: int = Query(50, ge=1, le=100),
     offset: int = Query(0, ge=0),
-    user_jwt: str = Depends(get_current_user_jwt),
+    conn: asyncpg.Connection = Depends(get_db),
 ):
     """Get replies to a message thread."""
     try:
         replies = await get_thread_replies(
             parent_message_id=message_id,
-            user_jwt=user_jwt,
+            conn=conn,
             limit=limit,
             offset=offset,
         )
@@ -602,14 +603,14 @@ async def add_reaction_to_message(
     message_id: str,
     body: AddReactionRequest,
     user_id: str = Depends(get_current_user_id),
-    user_jwt: str = Depends(get_current_user_jwt),
+    conn: asyncpg.Connection = Depends(get_db),
 ):
     """Add a reaction to a message."""
     try:
         reaction = await add_reaction(
             message_id=message_id,
             user_id=user_id,
-            user_jwt=user_jwt,
+            conn=conn,
             emoji=body.emoji,
         )
         return {"reaction": reaction}
@@ -623,11 +624,11 @@ async def remove_reaction_from_message(
     message_id: str,
     emoji: str,
     user_id: str = Depends(get_current_user_id),
-    user_jwt: str = Depends(get_current_user_jwt),
+    conn: asyncpg.Connection = Depends(get_db),
 ):
     """Remove a reaction from a message."""
     try:
-        await remove_reaction(message_id, user_id, user_jwt, emoji)
+        await remove_reaction(message_id, user_id, conn, emoji)
         return {"success": True}
     except Exception as e:
         logger.error(f"Error removing reaction: {e}")

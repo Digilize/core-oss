@@ -1,9 +1,11 @@
 """Message management service for workspace messaging."""
 
 from typing import Dict, Any, List, Optional, Tuple
+import json
 import logging
-from lib.supabase_client import get_authenticated_async_client
-from lib.supabase_client import get_async_service_role_client
+import asyncpg
+
+from lib.db import get_admin_db_conn
 from lib.r2_client import get_r2_client
 from lib.image_proxy import generate_file_url, is_image_type
 from api.config import settings
@@ -41,9 +43,18 @@ def extract_plain_text(blocks: List[Dict[str, Any]]) -> str:
     return " ".join(text_parts).strip()
 
 
+def _row_to_dict(row) -> dict:
+    """Convert asyncpg Record to dict, stringifying datetime values."""
+    d = dict(row)
+    for k, v in d.items():
+        if hasattr(v, 'isoformat'):
+            d[k] = v.isoformat()
+    return d
+
+
 async def get_messages(
     channel_id: str,
-    user_jwt: str,
+    conn: asyncpg.Connection,
     limit: int = 50,
     offset: int = 0,
     before_id: Optional[str] = None,
@@ -54,7 +65,7 @@ async def get_messages(
 
     Args:
         channel_id: The channel ID
-        user_jwt: User's JWT for authenticated requests
+        conn: asyncpg connection (RLS user set)
         limit: Max number of messages to return
         offset: Offset for pagination
         before_id: Get messages before this message ID (for infinite scroll)
@@ -63,53 +74,74 @@ async def get_messages(
     Returns:
         List of messages with user info
     """
-    supabase = await get_authenticated_async_client(user_jwt)
-
     try:
-        query = (
-            supabase.table("channel_messages")
-            .select("*, user:users(id, email, name, avatar_url), agent:agent_instances(id, name, avatar_url), reactions:message_reactions(*)")
-            .eq("channel_id", channel_id)
-        )
+        # Build the base query joining user, agent and reactions
+        # We fetch the raw messages first then do sub-selects for related data
+        params: List[Any] = [channel_id]
+        conditions = ["cm.channel_id = $1"]
+        param_idx = 2
 
-        # Filter by thread or main messages
         if thread_parent_id:
-            query = query.eq("thread_parent_id", thread_parent_id)
+            conditions.append(f"cm.thread_parent_id = ${param_idx}")
+            params.append(thread_parent_id)
+            param_idx += 1
         else:
-            query = query.is_("thread_parent_id", "null")
+            conditions.append("cm.thread_parent_id IS NULL")
 
-        # Pagination — use composite (created_at, id) cursor to avoid
-        # skipping messages that share the same timestamp as the boundary.
         if before_id:
-            before_result = await (
-                supabase.table("channel_messages")
-                .select("created_at")
-                .eq("id", before_id)
-                .limit(1)
-                .execute()
+            before_row = await conn.fetchrow(
+                "SELECT created_at FROM channel_messages WHERE id = $1",
+                before_id,
             )
-            if before_result.data and len(before_result.data) > 0:
-                before_ts = before_result.data[0]["created_at"]
-                # Messages strictly older, OR same timestamp but with a smaller id
-                query = query.or_(
-                    f"created_at.lt.{before_ts},"
-                    f"and(created_at.eq.{before_ts},id.lt.{before_id})"
+            if before_row:
+                before_ts = before_row["created_at"]
+                conditions.append(
+                    f"(cm.created_at < ${param_idx} OR (cm.created_at = ${param_idx} AND cm.id < ${param_idx + 1}))"
                 )
+                params.extend([before_ts, before_id])
+                param_idx += 2
 
-        result = await (
-            query
-            .order("created_at", desc=True)
-            .order("id", desc=True)
-            .range(offset, offset + limit - 1)
-            .execute()
-        )
+        where_clause = " AND ".join(conditions)
+        sql = f"""
+            SELECT
+                cm.*,
+                json_build_object('id', u.id, 'email', u.email, 'name', u.name, 'avatar_url', u.avatar_url) AS "user",
+                CASE WHEN ai.id IS NOT NULL THEN
+                    json_build_object('id', ai.id, 'name', ai.name, 'avatar_url', ai.avatar_url)
+                ELSE NULL END AS agent,
+                COALESCE(
+                    json_agg(mr.*) FILTER (WHERE mr.id IS NOT NULL),
+                    '[]'::json
+                ) AS reactions
+            FROM channel_messages cm
+            LEFT JOIN users u ON u.id = cm.user_id
+            LEFT JOIN agent_instances ai ON ai.id = cm.agent_id
+            LEFT JOIN message_reactions mr ON mr.message_id = cm.id
+            WHERE {where_clause}
+            GROUP BY cm.id, u.id, u.email, u.name, u.avatar_url, ai.id, ai.name, ai.avatar_url
+            ORDER BY cm.created_at DESC, cm.id DESC
+            LIMIT ${param_idx} OFFSET ${param_idx + 1}
+        """
+        params.extend([limit, offset])
 
-        messages = result.data or []
+        rows = await conn.fetch(sql, *params)
+        messages = []
+        for row in rows:
+            d = _row_to_dict(row)
+            # Decode JSON columns returned as strings by json_build_object
+            for col in ("user", "agent", "reactions"):
+                if isinstance(d.get(col), str):
+                    try:
+                        d[col] = json.loads(d[col])
+                    except Exception:
+                        pass
+            messages.append(d)
+
         # Reverse to get chronological order
         messages.reverse()
 
         # Enrich file blocks with presigned URLs
-        await _enrich_messages_with_file_urls(messages, user_jwt)
+        await _enrich_messages_with_file_urls(messages, conn)
 
         logger.info(f"Retrieved {len(messages)} messages from channel {channel_id}")
         return messages
@@ -121,33 +153,49 @@ async def get_messages(
 
 async def get_message(
     message_id: str,
-    user_jwt: str,
+    conn: asyncpg.Connection,
 ) -> Optional[Dict[str, Any]]:
     """
     Get a single message by ID.
 
     Args:
         message_id: The message ID
-        user_jwt: User's JWT for authenticated requests
+        conn: asyncpg connection (RLS user set)
 
     Returns:
         Message data or None if not found
     """
-    supabase = await get_authenticated_async_client(user_jwt)
-
     try:
-        result = await (
-            supabase.table("channel_messages")
-            .select("*, user:users(id, email, name, avatar_url), agent:agent_instances(id, name, avatar_url), reactions:message_reactions(*)")
-            .eq("id", message_id)
-            .limit(1)
-            .execute()
-        )
-
-        if result.data and len(result.data) > 0:
-            message = result.data[0]
-            await _enrich_messages_with_file_urls([message], user_jwt)
-            return message
+        sql = """
+            SELECT
+                cm.*,
+                json_build_object('id', u.id, 'email', u.email, 'name', u.name, 'avatar_url', u.avatar_url) AS "user",
+                CASE WHEN ai.id IS NOT NULL THEN
+                    json_build_object('id', ai.id, 'name', ai.name, 'avatar_url', ai.avatar_url)
+                ELSE NULL END AS agent,
+                COALESCE(
+                    json_agg(mr.*) FILTER (WHERE mr.id IS NOT NULL),
+                    '[]'::json
+                ) AS reactions
+            FROM channel_messages cm
+            LEFT JOIN users u ON u.id = cm.user_id
+            LEFT JOIN agent_instances ai ON ai.id = cm.agent_id
+            LEFT JOIN message_reactions mr ON mr.message_id = cm.id
+            WHERE cm.id = $1
+            GROUP BY cm.id, u.id, u.email, u.name, u.avatar_url, ai.id, ai.name, ai.avatar_url
+            LIMIT 1
+        """
+        row = await conn.fetchrow(sql, message_id)
+        if row:
+            d = _row_to_dict(row)
+            for col in ("user", "agent", "reactions"):
+                if isinstance(d.get(col), str):
+                    try:
+                        d[col] = json.loads(d[col])
+                    except Exception:
+                        pass
+            await _enrich_messages_with_file_urls([d], conn)
+            return d
         return None
 
     except Exception as e:
@@ -158,7 +206,7 @@ async def get_message(
 async def create_message(
     channel_id: str,
     user_id: str,
-    user_jwt: str,
+    conn: asyncpg.Connection,
     blocks: List[Dict[str, Any]],
     thread_parent_id: Optional[str] = None,
 ) -> Dict[str, Any]:
@@ -168,47 +216,55 @@ async def create_message(
     Args:
         channel_id: The channel ID
         user_id: User sending the message
-        user_jwt: User's JWT for authenticated requests
+        conn: asyncpg connection (RLS user set)
         blocks: Content blocks array
         thread_parent_id: If replying in a thread, the parent message ID
 
     Returns:
         Created message data
     """
-    supabase = await get_authenticated_async_client(user_jwt)
-
     # Extract plain text for search
     content = extract_plain_text(blocks)
 
     try:
-        insert_data = {
-            "channel_id": channel_id,
-            "user_id": user_id,
-            "content": content,
-            "blocks": blocks,
-        }
-
         if thread_parent_id:
-            insert_data["thread_parent_id"] = thread_parent_id
+            row = await conn.fetchrow(
+                """
+                INSERT INTO channel_messages (channel_id, user_id, content, blocks, thread_parent_id)
+                VALUES ($1, $2, $3, $4, $5)
+                RETURNING id
+                """,
+                channel_id,
+                user_id,
+                content,
+                json.dumps(blocks),
+                thread_parent_id,
+            )
+        else:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO channel_messages (channel_id, user_id, content, blocks)
+                VALUES ($1, $2, $3, $4)
+                RETURNING id
+                """,
+                channel_id,
+                user_id,
+                content,
+                json.dumps(blocks),
+            )
 
-        result = await (
-            supabase.table("channel_messages")
-            .insert(insert_data)
-            .execute()
-        )
-
-        if result.data and len(result.data) > 0:
-            message = result.data[0]
+        if row:
+            message_id = row["id"]
 
             # Fetch with user info
-            full_message = await get_message(message["id"], user_jwt)
-            logger.info(f"Created message {message['id']} in channel {channel_id}")
+            full_message = await get_message(str(message_id), conn)
+            logger.info(f"Created message {message_id} in channel {channel_id}")
 
             # Embed for semantic search (fire-and-forget)
             from lib.embed_hooks import embed_message
-            embed_message(message["id"], content)
+            embed_message(str(message_id), content)
 
-            return full_message or message
+            return full_message or {"id": str(message_id), "channel_id": channel_id}
 
         raise Exception("Failed to create message")
 
@@ -219,7 +275,7 @@ async def create_message(
 
 async def update_message(
     message_id: str,
-    user_jwt: str,
+    conn: asyncpg.Connection,
     blocks: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
     """
@@ -227,40 +283,38 @@ async def update_message(
 
     Args:
         message_id: The message ID
-        user_jwt: User's JWT for authenticated requests
+        conn: asyncpg connection (RLS user set)
         blocks: New content blocks array
 
     Returns:
         Updated message data
     """
-    supabase = await get_authenticated_async_client(user_jwt)
-
     # Extract plain text for search
     content = extract_plain_text(blocks)
 
     try:
-        result = await (
-            supabase.table("channel_messages")
-            .update({
-                "content": content,
-                "blocks": blocks,
-                "is_edited": True,
-                "edited_at": "now()",
-            })
-            .eq("id", message_id)
-            .execute()
+        row = await conn.fetchrow(
+            """
+            UPDATE channel_messages
+            SET content = $1, blocks = $2, is_edited = TRUE, edited_at = NOW()
+            WHERE id = $3
+            RETURNING id
+            """,
+            content,
+            json.dumps(blocks),
+            message_id,
         )
 
-        if result.data and len(result.data) > 0:
+        if row:
             # Fetch with user info (like create_message does)
-            full_message = await get_message(message_id, user_jwt)
+            full_message = await get_message(message_id, conn)
             logger.info(f"Updated message {message_id}")
 
             # Re-embed for semantic search (fire-and-forget)
             from lib.embed_hooks import embed_message
             embed_message(message_id, content)
 
-            return full_message or result.data[0]
+            return full_message or {"id": message_id}
 
         raise Exception("Message not found or no permission")
 
@@ -271,26 +325,22 @@ async def update_message(
 
 async def delete_message(
     message_id: str,
-    user_jwt: str,
+    conn: asyncpg.Connection,
 ) -> bool:
     """
     Delete a message.
 
     Args:
         message_id: The message ID
-        user_jwt: User's JWT for authenticated requests
+        conn: asyncpg connection (RLS user set)
 
     Returns:
         True if successful
     """
-    supabase = await get_authenticated_async_client(user_jwt)
-
     try:
-        await (
-            supabase.table("channel_messages")
-            .delete()
-            .eq("id", message_id)
-            .execute()
+        await conn.execute(
+            "DELETE FROM channel_messages WHERE id = $1",
+            message_id,
         )
 
         logger.info(f"Deleted message {message_id}")
@@ -304,7 +354,7 @@ async def delete_message(
 async def add_reaction(
     message_id: str,
     user_id: str,
-    user_jwt: str,
+    conn: asyncpg.Connection,
     emoji: str,
 ) -> Dict[str, Any]:
     """
@@ -313,36 +363,34 @@ async def add_reaction(
     Args:
         message_id: The message ID
         user_id: User adding the reaction
-        user_jwt: User's JWT for authenticated requests
+        conn: asyncpg connection (RLS user set)
         emoji: Emoji character/code
 
     Returns:
         Created reaction data
     """
-    supabase = await get_authenticated_async_client(user_jwt)
-
     try:
-        result = await (
-            supabase.table("message_reactions")
-            .insert({
-                "message_id": message_id,
-                "user_id": user_id,
-                "emoji": emoji,
-            })
-            .execute()
+        row = await conn.fetchrow(
+            """
+            INSERT INTO message_reactions (message_id, user_id, emoji)
+            VALUES ($1, $2, $3)
+            ON CONFLICT DO NOTHING
+            RETURNING *
+            """,
+            message_id,
+            user_id,
+            emoji,
         )
 
-        if result.data and len(result.data) > 0:
+        if row:
             logger.info(f"Added reaction {emoji} to message {message_id}")
-            return result.data[0]
+            return _row_to_dict(row)
 
-        raise Exception("Failed to add reaction")
+        # Duplicate — reaction already exists
+        logger.info(f"Reaction {emoji} already exists on message {message_id}")
+        return {"message_id": message_id, "user_id": user_id, "emoji": emoji}
 
     except Exception as e:
-        # Could be duplicate - that's okay
-        if "duplicate" in str(e).lower():
-            logger.info(f"Reaction {emoji} already exists on message {message_id}")
-            return {"message_id": message_id, "user_id": user_id, "emoji": emoji}
         logger.error(f"Error adding reaction: {e}")
         raise
 
@@ -350,7 +398,7 @@ async def add_reaction(
 async def remove_reaction(
     message_id: str,
     user_id: str,
-    user_jwt: str,
+    conn: asyncpg.Connection,
     emoji: str,
 ) -> bool:
     """
@@ -359,22 +407,18 @@ async def remove_reaction(
     Args:
         message_id: The message ID
         user_id: User removing the reaction
-        user_jwt: User's JWT for authenticated requests
+        conn: asyncpg connection (RLS user set)
         emoji: Emoji character/code
 
     Returns:
         True if successful
     """
-    supabase = await get_authenticated_async_client(user_jwt)
-
     try:
-        await (
-            supabase.table("message_reactions")
-            .delete()
-            .eq("message_id", message_id)
-            .eq("user_id", user_id)
-            .eq("emoji", emoji)
-            .execute()
+        await conn.execute(
+            "DELETE FROM message_reactions WHERE message_id = $1 AND user_id = $2 AND emoji = $3",
+            message_id,
+            user_id,
+            emoji,
         )
 
         logger.info(f"Removed reaction {emoji} from message {message_id}")
@@ -387,7 +431,7 @@ async def remove_reaction(
 
 async def get_thread_replies(
     parent_message_id: str,
-    user_jwt: str,
+    conn: asyncpg.Connection,
     limit: int = 50,
     offset: int = 0,
 ) -> List[Dict[str, Any]]:
@@ -396,29 +440,48 @@ async def get_thread_replies(
 
     Args:
         parent_message_id: The parent message ID
-        user_jwt: User's JWT for authenticated requests
+        conn: asyncpg connection (RLS user set)
         limit: Max number of replies
         offset: Offset for pagination
 
     Returns:
         List of thread replies
     """
-    supabase = await get_authenticated_async_client(user_jwt)
-
     try:
-        result = await (
-            supabase.table("channel_messages")
-            .select("*, user:users(id, email, name, avatar_url), agent:agent_instances(id, name, avatar_url), reactions:message_reactions(*)")
-            .eq("thread_parent_id", parent_message_id)
-            .order("created_at")
-            .range(offset, offset + limit - 1)
-            .execute()
-        )
-
-        replies = result.data or []
+        sql = """
+            SELECT
+                cm.*,
+                json_build_object('id', u.id, 'email', u.email, 'name', u.name, 'avatar_url', u.avatar_url) AS "user",
+                CASE WHEN ai.id IS NOT NULL THEN
+                    json_build_object('id', ai.id, 'name', ai.name, 'avatar_url', ai.avatar_url)
+                ELSE NULL END AS agent,
+                COALESCE(
+                    json_agg(mr.*) FILTER (WHERE mr.id IS NOT NULL),
+                    '[]'::json
+                ) AS reactions
+            FROM channel_messages cm
+            LEFT JOIN users u ON u.id = cm.user_id
+            LEFT JOIN agent_instances ai ON ai.id = cm.agent_id
+            LEFT JOIN message_reactions mr ON mr.message_id = cm.id
+            WHERE cm.thread_parent_id = $1
+            GROUP BY cm.id, u.id, u.email, u.name, u.avatar_url, ai.id, ai.name, ai.avatar_url
+            ORDER BY cm.created_at ASC
+            LIMIT $2 OFFSET $3
+        """
+        rows = await conn.fetch(sql, parent_message_id, limit, offset)
+        replies = []
+        for row in rows:
+            d = _row_to_dict(row)
+            for col in ("user", "agent", "reactions"):
+                if isinstance(d.get(col), str):
+                    try:
+                        d[col] = json.loads(d[col])
+                    except Exception:
+                        pass
+            replies.append(d)
 
         # Enrich file blocks with presigned URLs
-        await _enrich_messages_with_file_urls(replies, user_jwt)
+        await _enrich_messages_with_file_urls(replies, conn)
 
         return replies
 
@@ -431,7 +494,7 @@ async def get_thread_replies(
 # Helpers: Enrich file blocks with image proxy / presigned download URLs
 # =============================================================================
 
-async def _enrich_messages_with_file_urls(messages: List[Dict[str, Any]], user_jwt: str) -> None:
+async def _enrich_messages_with_file_urls(messages: List[Dict[str, Any]], conn: asyncpg.Connection) -> None:
     """
     Scan message blocks and attach URLs for file blocks.
 
@@ -445,7 +508,7 @@ async def _enrich_messages_with_file_urls(messages: List[Dict[str, Any]], user_j
 
     # Feature flag: use legacy presigned URLs if proxy is not configured
     if not settings.image_proxy_url or not settings.image_proxy_secret:
-        return await _enrich_messages_with_file_urls_legacy(messages, user_jwt)
+        return await _enrich_messages_with_file_urls_legacy(messages, conn)
 
     # Collect ALL file blocks by file_id for a single batch DB lookup.
     # Never trust client-supplied r2_key — always resolve from DB via file_id
@@ -469,26 +532,22 @@ async def _enrich_messages_with_file_urls(messages: List[Dict[str, Any]], user_j
         return
 
     # Single batch query: resolve file_id -> (r2_key, file_type) from DB.
-    # Uses the authenticated client so RLS enforces the user can only
-    # access files they own or that belong to their workspace.
+    # Uses the RLS-enforced connection so users can only access files they own
+    # or that belong to their workspace.
     try:
-        auth_client = await get_authenticated_async_client(user_jwt)
-        result = await (
-            auth_client.table("files")
-            .select("id, r2_key, file_type")
-            .in_("id", list(file_id_to_blocks.keys()))
-            .execute()
+        file_ids = list(file_id_to_blocks.keys())
+        rows = await conn.fetch(
+            "SELECT id, r2_key, file_type FROM files WHERE id = ANY($1::uuid[])",
+            file_ids,
         )
-        for f in (result.data or []):
+        for f in rows:
             r2_key = f.get("r2_key")
             if not r2_key:
                 continue
-            mime = f.get("file_type", "application/octet-stream")
-            for data_ref in file_id_to_blocks.get(f["id"], []):
+            mime = f.get("file_type") or "application/octet-stream"
+            for data_ref in file_id_to_blocks.get(str(f["id"]), []):
                 data_ref["r2_key"] = r2_key
                 if is_image_type(mime):
-                    # Use a dedicated chat-optimized inline variant for faster
-                    # loads while keeping good quality on high-DPI screens.
                     chat_url = generate_file_url(r2_key, mime, "chat")
                     preview_url = generate_file_url(r2_key, mime, "preview")
                     full_url = generate_file_url(r2_key, mime, "full")
@@ -500,18 +559,18 @@ async def _enrich_messages_with_file_urls(messages: List[Dict[str, Any]], user_j
                     data_ref["url"] = generate_file_url(r2_key, mime, "full")
     except Exception as e:
         logger.warning(f"Batch file lookup failed, falling back to legacy: {e}")
-        await _enrich_messages_with_file_urls_legacy(messages, user_jwt)
+        await _enrich_messages_with_file_urls_legacy(messages, conn)
 
 
-async def _enrich_messages_with_file_urls_legacy(messages: List[Dict[str, Any]], user_jwt: str) -> None:
+async def _enrich_messages_with_file_urls_legacy(messages: List[Dict[str, Any]], conn: asyncpg.Connection) -> None:
     """Legacy enrichment using presigned URLs and per-file DB queries.
 
     Kept as fallback when image proxy is not configured.
+    Uses get_admin_db_conn for channel/file lookups (bypasses RLS for metadata).
     """
     if not messages:
         return
 
-    admin = await get_async_service_role_client()
     r2 = get_r2_client()
 
     channel_ctx_cache: Dict[str, Tuple[str, str]] = {}
@@ -521,29 +580,36 @@ async def _enrich_messages_with_file_urls_legacy(messages: List[Dict[str, Any]],
         if channel_id in channel_ctx_cache:
             return channel_ctx_cache[channel_id]
 
-        ctx_res = await (
-            admin
-            .table("channels")
-            .select("id, workspace_app_id, app:workspace_apps(id, workspace_id)")
-            .eq("id", channel_id)
-            .limit(1)
-            .execute()
-        )
-        if not ctx_res.data:
+        async with get_admin_db_conn() as admin:
+            ctx_row = await admin.fetchrow(
+                """
+                SELECT c.workspace_app_id, wa.workspace_id
+                FROM channels c
+                LEFT JOIN workspace_apps wa ON wa.id = c.workspace_app_id
+                WHERE c.id = $1
+                """,
+                channel_id,
+            )
+
+        if not ctx_row:
             raise Exception("Channel context not found")
 
-        wa_id = ctx_res.data[0]["workspace_app_id"]
-        ws_id = (ctx_res.data[0].get("app") or {}).get("workspace_id")
+        wa_id = ctx_row["workspace_app_id"]
+        ws_id = ctx_row["workspace_id"]
+
         if not ws_id:
-            app_res = await (
-                admin.table("workspace_apps").select("workspace_id").eq("id", wa_id).limit(1).execute()
-            )
-            ws_id = app_res.data[0]["workspace_id"] if app_res.data else None
+            async with get_admin_db_conn() as admin:
+                wa_row = await admin.fetchrow(
+                    "SELECT workspace_id FROM workspace_apps WHERE id = $1",
+                    wa_id,
+                )
+            ws_id = wa_row["workspace_id"] if wa_row else None
+
         if not ws_id:
             raise Exception("Workspace context not found for channel")
 
-        channel_ctx_cache[channel_id] = (ws_id, wa_id)
-        return ws_id, wa_id
+        channel_ctx_cache[channel_id] = (str(ws_id), str(wa_id))
+        return str(ws_id), str(wa_id)
 
     for msg in messages:
         blocks = msg.get("blocks") or []
@@ -569,36 +635,27 @@ async def _enrich_messages_with_file_urls_legacy(messages: List[Dict[str, Any]],
                 r2_key = data.get("r2_key")
                 url: Optional[str] = None
 
-                if file_id:
-                    if file_id in file_url_cache:
-                        url = file_url_cache[file_id]
-                    else:
-                        f_res = await (
-                            admin
-                            .table("files")
-                            .select("id, r2_key, workspace_id, workspace_app_id")
-                            .eq("id", file_id)
-                            .limit(1)
-                            .execute()
+                async with get_admin_db_conn() as admin:
+                    if file_id:
+                        if file_id in file_url_cache:
+                            url = file_url_cache[file_id]
+                        else:
+                            f_row = await admin.fetchrow(
+                                "SELECT id, r2_key, workspace_id, workspace_app_id FROM files WHERE id = $1",
+                                file_id,
+                            )
+                            if f_row:
+                                if str(f_row.get("workspace_id")) == ws_id or str(f_row.get("workspace_app_id")) == wa_id:
+                                    url = r2.get_presigned_url(f_row["r2_key"], expiration=3600)
+                                    file_url_cache[file_id] = url
+                    elif r2_key:
+                        f2_row = await admin.fetchrow(
+                            "SELECT id, workspace_id, workspace_app_id FROM files WHERE r2_key = $1",
+                            r2_key,
                         )
-                        if f_res.data:
-                            f = f_res.data[0]
-                            if f.get("workspace_id") == ws_id or f.get("workspace_app_id") == wa_id:
-                                url = r2.get_presigned_url(f["r2_key"], expiration=3600)
-                                file_url_cache[file_id] = url
-                elif r2_key:
-                    f2_res = await (
-                        admin
-                        .table("files")
-                        .select("id, workspace_id, workspace_app_id")
-                        .eq("r2_key", r2_key)
-                        .limit(1)
-                        .execute()
-                    )
-                    if f2_res.data:
-                        f2 = f2_res.data[0]
-                        if f2.get("workspace_id") == ws_id or f2.get("workspace_app_id") == wa_id:
-                            url = r2.get_presigned_url(r2_key, expiration=3600)
+                        if f2_row:
+                            if str(f2_row.get("workspace_id")) == ws_id or str(f2_row.get("workspace_app_id")) == wa_id:
+                                url = r2.get_presigned_url(r2_key, expiration=3600)
 
                 if url:
                     data["url"] = url

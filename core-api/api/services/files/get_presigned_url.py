@@ -1,9 +1,9 @@
 """Get presigned URL service - generates temporary download URLs for files."""
 
 from typing import Optional
+import asyncpg
 import logging
 
-from lib.supabase_client import get_authenticated_supabase_client
 from lib.r2_client import get_r2_client
 
 logger = logging.getLogger(__name__)
@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 
 async def get_presigned_url(
     user_id: str,
-    user_jwt: str,
+    conn: asyncpg.Connection,
     file_id: str,
     expiration: Optional[int] = None,
 ) -> dict:
@@ -20,7 +20,7 @@ async def get_presigned_url(
 
     Args:
         user_id: The ID of the user requesting the URL
-        user_jwt: The user's JWT token for authentication
+        conn: Authenticated asyncpg connection (RLS already set for this user)
         file_id: The ID of the file
         expiration: URL expiration in seconds (default: from settings)
 
@@ -31,23 +31,25 @@ async def get_presigned_url(
         Exception: If file not found
     """
     r2_client = get_r2_client()
-    supabase = get_authenticated_supabase_client(user_jwt)
 
-    logger.info(f"🔗 Generating presigned URL for file {file_id}")
+    logger.info(f"Generating presigned URL for file {file_id}")
 
-    # Get file metadata (RLS ensures user owns it)
-    response = supabase.table("files").select("*").eq("id", file_id).execute()
+    # Get file metadata (RLS ensures user owns or can access it)
+    row = await conn.fetchrow(
+        "SELECT * FROM files WHERE id = $1",
+        file_id,
+    )
 
-    if not response.data:
+    if not row:
         raise Exception(f"File not found: {file_id}")
 
-    file_record = response.data[0]
+    file_record = dict(row)
     r2_key = file_record["r2_key"]
 
     # Generate presigned URL
     url = r2_client.get_presigned_url(r2_key, expiration)
 
-    logger.info(f"✅ Generated presigned URL for: {file_id}")
+    logger.info(f"Generated presigned URL for: {file_id}")
 
     return {
         "url": url,

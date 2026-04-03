@@ -1,7 +1,8 @@
 """Service for retrieving documents."""
 from typing import Optional, List, Literal
 from fastapi import HTTPException, status
-from lib.supabase_client import get_authenticated_async_client, get_async_service_role_client
+import asyncpg
+import json
 from lib.image_proxy import generate_file_url, is_image_type
 from api.config import settings
 import logging
@@ -35,9 +36,23 @@ SortBy = Literal["name", "type", "date", "size", "position"]
 SortDirection = Literal["asc", "desc"]
 
 
+def _row_to_doc(row: asyncpg.Record) -> dict:
+    """Convert an asyncpg Record to a plain dict, handling the nested file sub-object."""
+    d = dict(row)
+    # file columns are prefixed with file__ — reconstruct nested dict
+    file_keys = [k for k in d if k.startswith("file__")]
+    if file_keys:
+        file_obj: dict = {}
+        for k in file_keys:
+            file_obj[k[len("file__"):]] = d.pop(k)
+        # Only attach if at least one file column is non-None
+        d["file"] = file_obj if any(v is not None for v in file_obj.values()) else None
+    return d
+
+
 async def get_documents(
     user_id: str,
-    user_jwt: str,
+    conn: asyncpg.Connection,
     parent_id: Optional[str] = None,
     workspace_id: Optional[str] = None,
     workspace_app_id: Optional[str] = None,
@@ -56,7 +71,7 @@ async def get_documents(
 
     Args:
         user_id: User ID
-        user_jwt: User's Supabase JWT for authenticated requests
+        conn: Authenticated asyncpg connection (RLS already set for this user)
         parent_id: Filter by parent document ID (None for root documents)
         workspace_id: Optional workspace ID to filter by
         workspace_app_id: Optional workspace app ID to filter by
@@ -71,149 +86,187 @@ async def get_documents(
     Returns:
         List of documents
     """
-    auth_supabase = await get_authenticated_async_client(user_jwt)
-
     try:
-        # Build query - if workspace filter provided, rely on RLS for access control
-        # Otherwise filter by user_id for personal documents
-        query = auth_supabase.table("documents").select("*, file:files(*)")
+        conditions: List[str] = []
+        params: List = []
 
-        # Apply workspace filters if provided to narrow scope.
-        # RLS handles access control in all cases — only accessible documents are returned.
+        def _p(val) -> str:
+            params.append(val)
+            return f"${len(params)}"
+
+        # Workspace filters
         if workspace_app_id:
-            query = query.eq("workspace_app_id", workspace_app_id)
+            conditions.append(f"d.workspace_app_id = {_p(workspace_app_id)}")
         elif workspace_ids:
-            query = query.in_("workspace_id", workspace_ids)
+            conditions.append(f"d.workspace_id = ANY({_p(workspace_ids)}::uuid[])")
         elif workspace_id:
-            query = query.eq("workspace_id", workspace_id)
-        # If no workspace filter, RLS still limits to accessible documents
-        # (owned, workspace member, or shared via permissions)
+            conditions.append(f"d.workspace_id = {_p(workspace_id)}")
 
-        # Filter by parent_id - None means root level (parent_id IS NULL)
-        # When fetch_all=True, skip parent_id filter to return all documents
+        # Parent filter
         if not fetch_all:
             if parent_id is not None:
-                query = query.eq("parent_id", parent_id)
+                conditions.append(f"d.parent_id = {_p(parent_id)}")
             else:
-                query = query.is_("parent_id", "null")
+                conditions.append("d.parent_id IS NULL")
 
-        # Filter archived
+        # Archived filter
         if not include_archived:
-            query = query.eq("is_archived", False)
+            conditions.append("d.is_archived = FALSE")
 
-        # Filter favorites
+        # Favorites filter
         if favorites_only:
-            query = query.eq("is_favorite", True)
+            conditions.append("d.is_favorite = TRUE")
 
-        # Filter by type
+        # Type filters
         if folders_only:
-            query = query.eq("is_folder", True)
+            conditions.append("d.is_folder = TRUE")
         elif documents_only:
-            query = query.eq("is_folder", False)
+            conditions.append("d.is_folder = FALSE")
 
-        # Filter by tags - using overlap operator (&&) to find docs with ANY matching tag
+        # Tags filter (overlap — doc has ANY of these tags)
         if tags:
-            query = query.overlaps("tags", tags)
+            conditions.append(f"d.tags && {_p(tags)}::text[]")
 
-        # Determine sort direction
+        where_clause = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+
+        # Sort column map
+        sort_column_map = {
+            "name": "d.title",
+            "type": "d.type",
+            "date": "d.updated_at",
+            "size": "d.updated_at",  # size sorting handled in Python after fetch
+            "position": "d.position",
+        }
+        sort_col = sort_column_map.get(sort_by, "d.updated_at")
+        direction = "DESC" if sort_direction == "desc" else "ASC"
         is_desc = sort_direction == "desc"
 
-        # Apply sorting based on sort_by parameter
-        # Map sort_by to database column(s)
-        sort_column_map = {
-            "name": "title",
-            "type": "type",
-            "date": "updated_at",
-            "size": None,  # Handled specially - needs Python sort
-            "position": "position",
-        }
+        sql = f"""
+            SELECT
+                d.*,
+                f.id          AS file__id,
+                f.user_id     AS file__user_id,
+                f.workspace_id AS file__workspace_id,
+                f.workspace_app_id AS file__workspace_app_id,
+                f.filename    AS file__filename,
+                f.file_type   AS file__file_type,
+                f.file_size   AS file__file_size,
+                f.r2_key      AS file__r2_key,
+                f.status      AS file__status,
+                f.created_at  AS file__created_at,
+                f.uploaded_at AS file__uploaded_at
+            FROM documents d
+            LEFT JOIN files f ON f.id = d.file_id
+            {where_clause}
+            ORDER BY {sort_col} {direction}
+        """
 
-        sort_column = sort_column_map.get(sort_by, "updated_at")
+        rows = await conn.fetch(sql, *params)
+        documents = [_row_to_doc(r) for r in rows]
 
         if sort_by == "size":
-            # For size sorting, we need to fetch and sort in Python
-            # because PostgREST doesn't support ordering by joined table columns directly
-            query = query.order("updated_at", desc=is_desc)
-            result = await query.execute()
-            documents = result.data
-
-            # Sort all items by file size (folders/notes have size 0)
             def get_file_size(doc: dict) -> int:
                 file_data = doc.get("file")
                 if file_data and isinstance(file_data, dict):
                     return file_data.get("file_size", 0) or 0
                 return 0
-
             documents.sort(key=get_file_size, reverse=is_desc)
 
-            logger.info(f"Retrieved {len(documents)} documents for user {user_id} (sorted by size)")
-            _enrich_documents_with_image_urls(documents)
-            return documents
-        else:
-            # Sort by the specified column
-            query = query.order(sort_column, desc=is_desc)
-            result = await query.execute()
-
-            logger.info(f"Retrieved {len(result.data)} documents for user {user_id}")
-            _enrich_documents_with_image_urls(result.data)
-            return result.data
+        logger.info(f"Retrieved {len(documents)} documents for user {user_id}")
+        _enrich_documents_with_image_urls(documents)
+        return documents
 
     except Exception as e:
         logger.error(f"Error retrieving documents: {str(e)}")
         raise
 
 
-async def get_document_by_id(user_id: str, user_jwt: str, document_id: str) -> Optional[dict]:
+async def get_document_by_id(user_id: str, conn: asyncpg.Connection, document_id: str) -> Optional[dict]:
     """
     Get a specific document by ID.
-    
+
     This will return the document if:
     1. User owns the document, OR
     2. Document is shared with the user
-    
+
     Only updates last_opened_at for owned documents.
-    
+
     Args:
         user_id: User ID
-        user_jwt: User's Supabase JWT for authenticated requests
+        conn: Authenticated asyncpg connection (RLS already set for this user)
         document_id: Document ID
-    
+
     Returns:
         Document record or None if not found/no access
     """
-    auth_supabase = await get_authenticated_async_client(user_jwt)
-
     try:
-        # First, try to get the document (RLS will check access)
-        # Don't filter by user_id - let RLS handle access control
-        # RLS allows SELECT if user owns it OR has workspace app access (can_access_workspace_app)
-        result = await (
-            auth_supabase.table("documents")
-            .select("*, file:files(*), owner:users!documents_user_id_fkey(id, email, name, avatar_url)")
-            .eq("id", document_id)
-            .execute()
+        row = await conn.fetchrow(
+            """
+            SELECT
+                d.*,
+                f.id          AS file__id,
+                f.user_id     AS file__user_id,
+                f.workspace_id AS file__workspace_id,
+                f.workspace_app_id AS file__workspace_app_id,
+                f.filename    AS file__filename,
+                f.file_type   AS file__file_type,
+                f.file_size   AS file__file_size,
+                f.r2_key      AS file__r2_key,
+                f.status      AS file__status,
+                f.created_at  AS file__created_at,
+                f.uploaded_at AS file__uploaded_at,
+                u.id          AS owner__id,
+                u.email       AS owner__email,
+                u.name        AS owner__name,
+                u.avatar_url  AS owner__avatar_url
+            FROM documents d
+            LEFT JOIN files f ON f.id = d.file_id
+            LEFT JOIN users u ON u.id = d.user_id
+            WHERE d.id = $1
+            """,
+            document_id,
         )
 
-        if not result.data:
-            # RLS returned nothing — check if document actually exists (service role bypasses RLS)
-            from lib.supabase_client import get_async_service_role_client
-            sr = await get_async_service_role_client()
-            exists = await sr.table("documents").select("id").eq("id", document_id).maybe_single().execute()
-            if exists.data:
-                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="You don't have access to this document")
+        if row is None:
+            # RLS returned nothing — check if document actually exists (admin conn)
+            from lib.db import get_admin_db_conn
+            async with get_admin_db_conn() as admin_conn:
+                exists = await admin_conn.fetchrow(
+                    "SELECT id FROM documents WHERE id = $1", document_id
+                )
+            if exists:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="You don't have access to this document",
+                )
             return None
-        
-        doc = result.data[0]
 
-        # Update last_opened_at
+        doc = _row_to_doc(row)
+
+        # Reconstruct owner sub-object
+        owner_keys = [k for k in doc if k.startswith("owner__")]
+        if owner_keys:
+            owner_obj: dict = {}
+            for k in owner_keys:
+                owner_obj[k[len("owner__"):]] = doc.pop(k)
+            doc["owner"] = owner_obj if any(v is not None for v in owner_obj.values()) else None
+
+        # Update last_opened_at (best-effort, only for owned documents)
         from datetime import datetime, timezone
-        await auth_supabase.table("documents").update({
-            "last_opened_at": datetime.now(timezone.utc).isoformat()
-        }).eq("id", document_id).eq("user_id", user_id).execute()
+        await conn.execute(
+            """
+            UPDATE documents
+            SET last_opened_at = $1
+            WHERE id = $2 AND user_id = $3
+            """,
+            datetime.now(timezone.utc),
+            document_id,
+            user_id,
+        )
 
         _enrich_documents_with_image_urls([doc])
         return doc
-        
+
     except Exception as e:
         logger.error(f"Error retrieving document {document_id}: {str(e)}")
         raise
@@ -221,7 +274,7 @@ async def get_document_by_id(user_id: str, user_jwt: str, document_id: str) -> O
 
 async def assert_document_access(
     user_id: str,
-    user_jwt: str,
+    conn: asyncpg.Connection,
     document_id: str,
 ) -> None:
     """Raise if the user cannot read the target document row.
@@ -230,23 +283,21 @@ async def assert_document_access(
     ``last_opened_at`` side effect, so it is safe for authorization-only checks
     such as notification subscription gating.
     """
-    auth_supabase = await get_authenticated_async_client(user_jwt)
-
     try:
-        result = await (
-            auth_supabase.table("documents")
-            .select("id")
-            .eq("id", document_id)
-            .limit(1)
-            .execute()
+        row = await conn.fetchrow(
+            "SELECT id FROM documents WHERE id = $1 LIMIT 1",
+            document_id,
         )
 
-        if result.data:
+        if row is not None:
             return
 
-        sr = await get_async_service_role_client()
-        exists = await sr.table("documents").select("id").eq("id", document_id).maybe_single().execute()
-        if exists.data:
+        from lib.db import get_admin_db_conn
+        async with get_admin_db_conn() as admin_conn:
+            exists = await admin_conn.fetchrow(
+                "SELECT id FROM documents WHERE id = $1", document_id
+            )
+        if exists:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="You don't have access to this document",

@@ -5,7 +5,7 @@ Provides GitHub-style flat, chronological comments on issues with reactions.
 """
 from typing import Dict, Any, List
 import logging
-from lib.supabase_client import get_authenticated_async_client
+import asyncpg
 from api.services.notifications.subscriptions import subscribe
 from api.services.notifications.create import notify_subscribers, NotificationType
 from api.services.notifications.helpers import get_actor_info
@@ -42,7 +42,7 @@ def extract_plain_text(blocks: List[Dict[str, Any]]) -> str:
 
 
 async def get_comments(
-    user_jwt: str,
+    conn: asyncpg.Connection,
     issue_id: str,
     limit: int = 100,
     offset: int = 0,
@@ -51,7 +51,7 @@ async def get_comments(
     Get comments for an issue, ordered chronologically.
 
     Args:
-        user_jwt: User's Supabase JWT
+        conn: asyncpg connection
         issue_id: Issue UUID
         limit: Max comments to return
         offset: Pagination offset
@@ -59,38 +59,59 @@ async def get_comments(
     Returns:
         Dict with comments list, page_count, and total_count
     """
-    supabase = await get_authenticated_async_client(user_jwt)
-
     # Get total count first
-    count_result = await supabase.table("project_issue_comments")\
-        .select("id", count="exact")\
-        .eq("issue_id", issue_id)\
-        .execute()
-    total_count = count_result.count or 0
+    count_row = await conn.fetchrow(
+        "SELECT COUNT(*) AS cnt FROM project_issue_comments WHERE issue_id = $1",
+        issue_id,
+    )
+    total_count = count_row["cnt"] if count_row else 0
 
-    # Get comments with user info
-    result = await supabase.table("project_issue_comments")\
-        .select("*, user:users(id, email, name, avatar_url)")\
-        .eq("issue_id", issue_id)\
-        .order("created_at")\
-        .range(offset, offset + limit - 1)\
-        .execute()
+    # Get comments with user info via JOIN
+    rows = await conn.fetch(
+        """
+        SELECT
+            c.*,
+            u.id AS user__id,
+            u.email AS user__email,
+            u.name AS user__name,
+            u.avatar_url AS user__avatar_url
+        FROM project_issue_comments c
+        LEFT JOIN users u ON u.id = c.user_id
+        WHERE c.issue_id = $1
+        ORDER BY c.created_at
+        LIMIT $2 OFFSET $3
+        """,
+        issue_id,
+        limit,
+        offset,
+    )
 
-    comments = result.data or []
+    comments = []
+    comment_ids = []
+    for row in rows:
+        d = dict(row)
+        # Reconstruct nested user object
+        d["user"] = {
+            "id": d.pop("user__id"),
+            "email": d.pop("user__email"),
+            "name": d.pop("user__name"),
+            "avatar_url": d.pop("user__avatar_url"),
+        }
+        comments.append(d)
+        comment_ids.append(d["id"])
 
     # Get reactions for all comments in one query
     if comments:
-        comment_ids = [c["id"] for c in comments]
-        reactions_result = await supabase.table("project_comment_reactions")\
-            .select("*")\
-            .in_("comment_id", comment_ids)\
-            .execute()
+        reaction_rows = await conn.fetch(
+            "SELECT * FROM project_comment_reactions WHERE comment_id = ANY($1)",
+            comment_ids,
+        )
 
         # Build reaction lookup by comment_id
         reactions_by_comment: Dict[str, List[Dict[str, Any]]] = {}
-        for reaction in (reactions_result.data or []):
-            comment_id = reaction["comment_id"]
-            reactions_by_comment.setdefault(comment_id, []).append(reaction)
+        for reaction in reaction_rows:
+            r = dict(reaction)
+            reactions_by_comment.setdefault(r["comment_id"], []).append(r)
 
         # Attach reactions to comments
         for comment in comments:
@@ -105,7 +126,7 @@ async def get_comments(
 
 async def create_comment(
     user_id: str,
-    user_jwt: str,
+    conn: asyncpg.Connection,
     issue_id: str,
     blocks: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
@@ -114,55 +135,70 @@ async def create_comment(
 
     Args:
         user_id: Current user's UUID
-        user_jwt: User's Supabase JWT
+        conn: asyncpg connection
         issue_id: Issue UUID
         blocks: Content blocks
 
     Returns:
         Created comment dict with user info
     """
-    supabase = await get_authenticated_async_client(user_jwt)
+    import json
 
     # Get issue to obtain workspace_app_id, workspace_id, and title
-    issue_result = await supabase.table("project_issues")\
-        .select("workspace_app_id, workspace_id, title, board_id")\
-        .eq("id", issue_id)\
-        .single()\
-        .execute()
+    issue_row = await conn.fetchrow(
+        "SELECT workspace_app_id, workspace_id, title, board_id FROM project_issues WHERE id = $1",
+        issue_id,
+    )
 
-    issue = issue_result.data
-    if not issue:
+    if not issue_row:
         raise ValueError(f"Issue not found: {issue_id}")
+    issue = dict(issue_row)
 
     # Extract plain text for search
     content = extract_plain_text(blocks)
 
     # Create comment
-    insert_data = {
-        "workspace_app_id": issue["workspace_app_id"],
-        "workspace_id": issue["workspace_id"],
-        "issue_id": issue_id,
-        "user_id": user_id,
-        "content": content,
-        "blocks": blocks,
-    }
+    comment_row = await conn.fetchrow(
+        """
+        INSERT INTO project_issue_comments
+            (workspace_app_id, workspace_id, issue_id, user_id, content, blocks)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        RETURNING *
+        """,
+        issue["workspace_app_id"],
+        issue["workspace_id"],
+        issue_id,
+        user_id,
+        content,
+        json.dumps(blocks),
+    )
 
-    result = await supabase.table("project_issue_comments")\
-        .insert(insert_data)\
-        .execute()
-
-    comment = result.data[0] if result.data else None
-    if not comment:
+    if not comment_row:
         raise ValueError("Failed to create comment")
 
     # Fetch with user info
-    full_result = await supabase.table("project_issue_comments")\
-        .select("*, user:users(id, email, name, avatar_url)")\
-        .eq("id", comment["id"])\
-        .single()\
-        .execute()
+    full_row = await conn.fetchrow(
+        """
+        SELECT
+            c.*,
+            u.id AS user__id,
+            u.email AS user__email,
+            u.name AS user__name,
+            u.avatar_url AS user__avatar_url
+        FROM project_issue_comments c
+        LEFT JOIN users u ON u.id = c.user_id
+        WHERE c.id = $1
+        """,
+        comment_row["id"],
+    )
 
-    comment = full_result.data
+    comment = dict(full_row)
+    comment["user"] = {
+        "id": comment.pop("user__id"),
+        "email": comment.pop("user__email"),
+        "name": comment.pop("user__name"),
+        "avatar_url": comment.pop("user__avatar_url"),
+    }
     comment["reactions"] = []
 
     # Auto-subscribe commenter and notify subscribers
@@ -193,7 +229,7 @@ async def create_comment(
 
 
 async def update_comment(
-    user_jwt: str,
+    conn: asyncpg.Connection,
     comment_id: str,
     blocks: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
@@ -201,56 +237,77 @@ async def update_comment(
     Update a comment's content (author only via RLS).
 
     Args:
-        user_jwt: User's Supabase JWT
+        conn: asyncpg connection
         comment_id: Comment UUID
         blocks: New content blocks
 
     Returns:
         Updated comment dict
     """
-    supabase = await get_authenticated_async_client(user_jwt)
+    import json
 
     # Extract plain text for search
     content = extract_plain_text(blocks)
 
-    # Update comment and fetch with user info in one call
-    result = await supabase.table("project_issue_comments")\
-        .update({
-            "content": content,
-            "blocks": blocks,
-            "is_edited": True,
-            "edited_at": "now()",
-        })\
-        .eq("id", comment_id)\
-        .select("*, user:users(id, email, name, avatar_url)")\
-        .single()\
-        .execute()
+    # Update comment
+    updated_row = await conn.fetchrow(
+        """
+        UPDATE project_issue_comments
+        SET content = $1, blocks = $2, is_edited = TRUE, edited_at = NOW()
+        WHERE id = $3
+        RETURNING *
+        """,
+        content,
+        json.dumps(blocks),
+        comment_id,
+    )
 
-    if not result.data:
+    if not updated_row:
         raise ValueError(f"Comment not found or unauthorized: {comment_id}")
 
-    comment = result.data
+    # Fetch with user info
+    full_row = await conn.fetchrow(
+        """
+        SELECT
+            c.*,
+            u.id AS user__id,
+            u.email AS user__email,
+            u.name AS user__name,
+            u.avatar_url AS user__avatar_url
+        FROM project_issue_comments c
+        LEFT JOIN users u ON u.id = c.user_id
+        WHERE c.id = $1
+        """,
+        comment_id,
+    )
 
-    # Get reactions (separate query - can't be combined with update)
-    reactions_result = await supabase.table("project_comment_reactions")\
-        .select("*")\
-        .eq("comment_id", comment_id)\
-        .execute()
+    comment = dict(full_row)
+    comment["user"] = {
+        "id": comment.pop("user__id"),
+        "email": comment.pop("user__email"),
+        "name": comment.pop("user__name"),
+        "avatar_url": comment.pop("user__avatar_url"),
+    }
 
-    comment["reactions"] = reactions_result.data or []
+    # Get reactions (separate query)
+    reaction_rows = await conn.fetch(
+        "SELECT * FROM project_comment_reactions WHERE comment_id = $1",
+        comment_id,
+    )
+    comment["reactions"] = [dict(r) for r in reaction_rows]
 
     return comment
 
 
 async def delete_comment(
-    user_jwt: str,
+    conn: asyncpg.Connection,
     comment_id: str,
 ) -> Dict[str, Any]:
     """
     Delete a comment (author or admin only via RLS).
 
     Args:
-        user_jwt: User's Supabase JWT
+        conn: asyncpg connection
         comment_id: Comment UUID
 
     Returns:
@@ -259,17 +316,14 @@ async def delete_comment(
     Raises:
         ValueError: If comment not found or unauthorized
     """
-    supabase = await get_authenticated_async_client(user_jwt)
-
     # Delete directly and check result - avoids pre-check blocking admin deletes
-    # when admin has DELETE permission but not SELECT permission
-    result = await supabase.table("project_issue_comments")\
-        .delete()\
-        .eq("id", comment_id)\
-        .execute()
+    result = await conn.execute(
+        "DELETE FROM project_issue_comments WHERE id = $1",
+        comment_id,
+    )
 
     # If nothing was deleted, the comment didn't exist or user wasn't authorized
-    if not result.data:
+    if result == "DELETE 0":
         raise ValueError(f"Comment not found or unauthorized: {comment_id}")
 
     return {"status": "deleted"}
@@ -277,7 +331,7 @@ async def delete_comment(
 
 async def add_reaction(
     user_id: str,
-    user_jwt: str,
+    conn: asyncpg.Connection,
     comment_id: str,
     emoji: str,
 ) -> Dict[str, Any]:
@@ -286,45 +340,43 @@ async def add_reaction(
 
     Args:
         user_id: Current user's UUID
-        user_jwt: User's Supabase JWT
+        conn: asyncpg connection
         comment_id: Comment UUID
         emoji: Emoji string
 
     Returns:
         Created reaction dict
     """
-    supabase = await get_authenticated_async_client(user_jwt)
-
     # Get comment to obtain workspace_app_id and workspace_id
-    comment_result = await supabase.table("project_issue_comments")\
-        .select("workspace_app_id, workspace_id")\
-        .eq("id", comment_id)\
-        .single()\
-        .execute()
+    comment_row = await conn.fetchrow(
+        "SELECT workspace_app_id, workspace_id FROM project_issue_comments WHERE id = $1",
+        comment_id,
+    )
 
-    comment = comment_result.data
-    if not comment:
+    if not comment_row:
         raise ValueError(f"Comment not found: {comment_id}")
 
     # Create reaction
-    insert_data = {
-        "workspace_app_id": comment["workspace_app_id"],
-        "workspace_id": comment["workspace_id"],
-        "comment_id": comment_id,
-        "user_id": user_id,
-        "emoji": emoji,
-    }
+    row = await conn.fetchrow(
+        """
+        INSERT INTO project_comment_reactions
+            (workspace_app_id, workspace_id, comment_id, user_id, emoji)
+        VALUES ($1, $2, $3, $4, $5)
+        RETURNING *
+        """,
+        comment_row["workspace_app_id"],
+        comment_row["workspace_id"],
+        comment_id,
+        user_id,
+        emoji,
+    )
 
-    result = await supabase.table("project_comment_reactions")\
-        .insert(insert_data)\
-        .execute()
-
-    return result.data[0] if result.data else {}
+    return dict(row) if row else {}
 
 
 async def remove_reaction(
     user_id: str,
-    user_jwt: str,
+    conn: asyncpg.Connection,
     comment_id: str,
     emoji: str,
 ) -> bool:
@@ -333,21 +385,19 @@ async def remove_reaction(
 
     Args:
         user_id: Current user's UUID
-        user_jwt: User's Supabase JWT
+        conn: asyncpg connection
         comment_id: Comment UUID
         emoji: Emoji string to remove
 
     Returns:
         True if successful
     """
-    supabase = await get_authenticated_async_client(user_jwt)
-
     # Explicit user_id filter for defense-in-depth (RLS also enforces this)
-    await supabase.table("project_comment_reactions")\
-        .delete()\
-        .eq("comment_id", comment_id)\
-        .eq("emoji", emoji)\
-        .eq("user_id", user_id)\
-        .execute()
+    await conn.execute(
+        "DELETE FROM project_comment_reactions WHERE comment_id = $1 AND emoji = $2 AND user_id = $3",
+        comment_id,
+        emoji,
+        user_id,
+    )
 
     return True

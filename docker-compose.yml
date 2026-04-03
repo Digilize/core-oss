@@ -1,0 +1,119 @@
+version: "3.9"
+
+# =============================================================================
+# Core OSS — Local Development
+# =============================================================================
+# Database: Neon DB (cloud-hosted Postgres — no local container needed)
+# Auth:      core-auth  (better-auth, port 3001)
+# API:       core-api   (FastAPI, port 8000)
+# Web:       core-web   (Vite, port 5173)
+#
+# Prerequisites:
+#   1. Copy .env.example → .env and fill in NEON_DATABASE_URL + secrets
+#   2. Run migrations: cd scripts && bash migrate-to-neon.sh
+#   3. Run better-auth migrations: cd core-auth && bun run migrate
+#
+# Usage:
+#   docker compose up          # all services
+#   docker compose up core-api # single service
+# =============================================================================
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # core-auth — better-auth email/password authentication service
+  # ---------------------------------------------------------------------------
+  core-auth:
+    build:
+      context: ./core-auth
+      dockerfile: Dockerfile
+    ports:
+      - "3001:3001"
+    environment:
+      DATABASE_URL: ${NEON_DATABASE_URL}
+      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET}
+      BETTER_AUTH_URL: ${BETTER_AUTH_URL:-http://localhost:3001}
+      CORE_API_URL: ${CORE_API_URL:-http://core-api:8000}
+      INTERNAL_API_SECRET: ${INTERNAL_API_SECRET}
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:5173}
+      NODE_ENV: ${NODE_ENV:-development}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3001/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # core-api — FastAPI backend
+  # ---------------------------------------------------------------------------
+  core-api:
+    build:
+      context: ./core-api
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      NEON_DATABASE_URL: ${NEON_DATABASE_URL}
+      INTERNAL_API_SECRET: ${INTERNAL_API_SECRET}
+      BETTER_AUTH_URL: ${BETTER_AUTH_URL:-http://core-auth:3001}
+
+      # AI providers (optional — at least one needed for /api/chat)
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+
+      # Cloudflare R2 (optional — needed for file uploads)
+      R2_ACCOUNT_ID: ${R2_ACCOUNT_ID:-}
+      R2_ACCESS_KEY_ID: ${R2_ACCESS_KEY_ID:-}
+      R2_SECRET_ACCESS_KEY: ${R2_SECRET_ACCESS_KEY:-}
+      R2_BUCKET_NAME: ${R2_BUCKET_NAME:-core-os-files}
+      R2_S3_API: ${R2_S3_API:-}
+      R2_PUBLIC_URL: ${R2_PUBLIC_URL:-}
+
+      # Image proxy (optional)
+      IMAGE_PROXY_SECRET: ${IMAGE_PROXY_SECRET:-}
+      IMAGE_PROXY_URL: ${IMAGE_PROXY_URL:-}
+
+      # Resend — workspace invitations (optional)
+      RESEND_API_KEY: ${RESEND_API_KEY:-}
+      RESEND_FROM_DOMAIN: ${RESEND_FROM_DOMAIN:-}
+      RESEND_FROM_EMAIL: ${RESEND_FROM_EMAIL:-}
+
+      # Exa — web search in AI chat (optional)
+      EXA_API_KEY: ${EXA_API_KEY:-}
+
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:5173}
+      API_ENV: ${API_ENV:-development}
+      DEBUG: ${DEBUG:-false}
+    depends_on:
+      core-auth:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # core-web — React/Vite frontend (development mode with HMR)
+  # ---------------------------------------------------------------------------
+  core-web:
+    build:
+      context: ./core-web
+      dockerfile: Dockerfile
+      target: dev
+    ports:
+      - "5173:5173"
+    environment:
+      VITE_API_URL: ${VITE_API_URL:-http://localhost:8000/api}
+      VITE_AUTH_URL: ${VITE_AUTH_URL:-http://localhost:3001}
+    volumes:
+      - ./core-web:/app
+      - /app/node_modules
+    depends_on:
+      - core-api
+    restart: unless-stopped

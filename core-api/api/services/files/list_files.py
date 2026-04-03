@@ -1,16 +1,15 @@
 """List files service - retrieves user's files from database."""
 
 from typing import Optional, List
+import asyncpg
 import logging
-
-from lib.supabase_client import get_authenticated_supabase_client
 
 logger = logging.getLogger(__name__)
 
 
 async def list_files(
     user_id: str,
-    user_jwt: str,
+    conn: asyncpg.Connection,
     workspace_ids: Optional[List[str]] = None,
     workspace_app_ids: Optional[List[str]] = None,
     # Singular convenience params (wrapped into lists internally)
@@ -25,7 +24,7 @@ async def list_files(
 
     Args:
         user_id: The ID of the user
-        user_jwt: The user's JWT token for authentication
+        conn: Authenticated asyncpg connection (RLS already set for this user)
         workspace_ids: Workspace IDs to filter by
         workspace_app_ids: Workspace app IDs to filter by (most specific)
         workspace_id: Single workspace ID (convenience, wrapped into list)
@@ -37,40 +36,54 @@ async def list_files(
     Returns:
         List of file metadata dicts
     """
-    supabase = get_authenticated_supabase_client(user_jwt)
-
     # Normalize singular params into lists
     if workspace_app_id and not workspace_app_ids:
         workspace_app_ids = [workspace_app_id]
     if workspace_id and not workspace_ids:
         workspace_ids = [workspace_id]
 
-    logger.info(f"📋 Listing files for user {user_id}")
+    logger.info(f"Listing files for user {user_id}")
 
     limit = min(limit, 100)
 
-    query = supabase.table("files").select("*")
+    conditions: List[str] = []
+    params: List = []
+
+    def _p(val) -> str:
+        params.append(val)
+        return f"${len(params)}"
 
     # Apply filters: most specific wins (RLS handles access control)
     if workspace_app_ids:
-        query = query.in_("workspace_app_id", workspace_app_ids)
+        conditions.append(f"workspace_app_id = ANY({_p(workspace_app_ids)}::uuid[])")
     elif workspace_ids:
-        query = query.in_("workspace_id", workspace_ids)
+        conditions.append(f"workspace_id = ANY({_p(workspace_ids)}::uuid[])")
     else:
-        query = query.eq("user_id", user_id)
+        conditions.append(f"user_id = {_p(user_id)}")
 
     # Filter by file type if specified
     if file_type:
         if file_type.endswith("/"):
-            query = query.like("file_type", f"{file_type}%")
+            conditions.append(f"file_type LIKE {_p(file_type + '%')}")
         else:
-            query = query.eq("file_type", file_type)
+            conditions.append(f"file_type = {_p(file_type)}")
 
-    query = query.order("uploaded_at", desc=True).range(offset, offset + limit - 1)
+    where_clause = "WHERE " + " AND ".join(conditions) if conditions else ""
 
-    response = query.execute()
+    params.append(limit)
+    params.append(offset)
+    limit_placeholder = f"${len(params) - 1}"
+    offset_placeholder = f"${len(params)}"
 
-    files = response.data or []
-    logger.info(f"✅ Found {len(files)} files")
+    sql = f"""
+        SELECT * FROM files
+        {where_clause}
+        ORDER BY uploaded_at DESC
+        LIMIT {limit_placeholder} OFFSET {offset_placeholder}
+    """
+
+    rows = await conn.fetch(sql, *params)
+    files = [dict(r) for r in rows]
+    logger.info(f"Found {len(files)} files")
 
     return files

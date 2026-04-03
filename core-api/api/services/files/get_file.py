@@ -1,15 +1,14 @@
 """Get file service - retrieves file metadata from database."""
 
+import asyncpg
 import logging
-
-from lib.supabase_client import get_authenticated_supabase_client
 
 logger = logging.getLogger(__name__)
 
 
 async def get_file(
     user_id: str,
-    user_jwt: str,
+    conn: asyncpg.Connection,
     file_id: str,
 ) -> dict:
     """
@@ -17,7 +16,7 @@ async def get_file(
 
     Args:
         user_id: The ID of the user requesting the file
-        user_jwt: The user's JWT token for authentication
+        conn: Authenticated asyncpg connection (RLS already set for this user)
         file_id: The ID of the file to retrieve
 
     Returns:
@@ -26,14 +25,15 @@ async def get_file(
     Raises:
         Exception: If file not found
     """
-    supabase = get_authenticated_supabase_client(user_jwt)
+    logger.info(f"Getting file {file_id} for user {user_id}")
 
-    logger.info(f"📄 Getting file {file_id} for user {user_id}")
+    row = await conn.fetchrow(
+        "SELECT * FROM files WHERE id = $1",
+        file_id,
+    )
 
-    response = supabase.table("files").select("*").eq("id", file_id).execute()
-
-    if not response.data:
+    if not row:
         raise Exception(f"File not found: {file_id}")
 
-    logger.info(f"✅ Found file: {file_id}")
-    return response.data[0]
+    logger.info(f"Found file: {file_id}")
+    return dict(row)

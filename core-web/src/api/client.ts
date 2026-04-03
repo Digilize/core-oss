@@ -2,7 +2,7 @@ import { useAuthStore, type UserProfile } from '../stores/authStore';
 import { API_BASE } from '../lib/apiBase';
 import { captureException } from '../lib/sentry';
 import { trackEvent } from '../lib/posthog';
-import { supabase } from '../lib/supabase';
+import { authClient } from '../lib/auth-client';
 
 // Singleton refresh promise to deduplicate concurrent refresh attempts
 let refreshPromise: Promise<string | null> | null = null;
@@ -22,9 +22,9 @@ async function refreshAccessToken(): Promise<string | null> {
   if (refreshPromise) return refreshPromise;
   refreshPromise = (async () => {
     try {
-      const { data, error } = await supabase.auth.refreshSession();
-      if (error || !data.session) return null;
-      return data.session.access_token;
+      const result = await authClient.getSession();
+      if (!result.data?.session) return null;
+      return result.data.session.token;
     } catch {
       return null;
     } finally {
@@ -40,16 +40,15 @@ async function ensureFreshToken(): Promise<string | null> {
   if (!session) return null;
   authFailureHandled = false;
 
-  // If token expires within 60 seconds, proactively refresh
-  const expiresAt = session.expires_at; // unix seconds
-  const now = Math.floor(Date.now() / 1000);
-  if (expiresAt && expiresAt - now > 60) {
-    return session.access_token;
+  // If token expires more than 60 seconds from now, use it as-is
+  const expiresAt = session.expiresAt instanceof Date ? session.expiresAt : new Date(session.expiresAt);
+  if (expiresAt.getTime() - Date.now() > 60_000) {
+    return session.token;
   }
 
-  // Token is expired or about to expire — refresh it
+  // Token is expired or about to expire — refresh via server-side session check
   const refreshed = await refreshAccessToken();
-  return refreshed ?? session.access_token;
+  return refreshed ?? session.token;
 }
 
 async function forceRefreshToken(): Promise<string | null> {

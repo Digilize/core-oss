@@ -1,82 +1,40 @@
 """
-FastAPI dependencies for authentication and authorization
+FastAPI dependencies for authentication and authorization.
+
+Replaces Supabase JWT validation with direct session table lookup against
+the shared Neon DB. Both core-auth (better-auth) and core-api use the same
+Neon DB, so the Python backend validates sessions by querying the session
+table directly — no JWKS endpoint or JWT libraries needed.
+
+Session validation:
+  SELECT user_id FROM "session"
+  WHERE token = $1 AND expires_at > NOW()
 """
+import asyncpg
+import logging
 import sentry_sdk
 from fastapi import Depends, Header, HTTPException, status
-from typing import Optional, Tuple, Dict, Any
-import jwt
-from jwt import PyJWKClient
-from api.config import settings
+from typing import Optional, AsyncGenerator
+
+from lib.db import get_pool, get_db_conn
+
+logger = logging.getLogger(__name__)
 
 
-# Cache the JWKS client for ES256 verification
-_jwks_client: Optional[PyJWKClient] = None
-
-
-def _get_jwks_client() -> PyJWKClient:
-    """Get or create cached JWKS client for Supabase."""
-    global _jwks_client
-    if _jwks_client is None:
-        jwks_url = f"{settings.supabase_url}/auth/v1/.well-known/jwks.json"
-        _jwks_client = PyJWKClient(jwks_url, cache_keys=True)
-    return _jwks_client
-
-
-def _decode_jwt(token: str) -> Dict[str, Any]:
-    """
-    Decode JWT supporting both HS256 (legacy) and ES256 (new ECC keys).
-    Checks the token header to determine which algorithm to use.
-    """
-    # Peek at the algorithm in the token header
-    try:
-        unverified_header = jwt.get_unverified_header(token)
-        alg = unverified_header.get("alg", "")
-    except jwt.DecodeError:
-        raise jwt.DecodeError("Invalid token format")
-
-    # ES256 - use JWKS public key
-    if alg == "ES256":
-        jwks_client = _get_jwks_client()
-        signing_key = jwks_client.get_signing_key_from_jwt(token)
-        return jwt.decode(
-            token,
-            signing_key.key,
-            algorithms=["ES256"],
-            audience="authenticated"
-        )
-
-    # HS256 - use shared secret (legacy)
-    if alg == "HS256":
-        if not settings.supabase_jwt_secret:
-            raise jwt.DecodeError("JWT secret not configured for HS256")
-        return jwt.decode(
-            token,
-            settings.supabase_jwt_secret,
-            algorithms=["HS256"],
-            audience="authenticated"
-        )
-
-    raise jwt.InvalidAlgorithmError(f"Unsupported algorithm: {alg}")
-
-
-async def get_validated_token_and_payload(
+async def get_current_user_id(
     authorization: Optional[str] = Header(None)
-) -> Tuple[str, Dict[str, Any]]:
+) -> str:
     """
-    Single source of truth for JWT validation.
-    Extracts, validates, and decodes the Supabase JWT from the Authorization header.
-    Supports both ES256 (new ECC keys) and HS256 (legacy shared secret).
+    Validate the better-auth session token from the Authorization header.
+
+    The frontend sends: Authorization: Bearer <session_token>
+    The session_token is the opaque token stored in better-auth's `session` table.
 
     Returns:
-        Tuple[str, Dict[str, Any]]: (token, payload) tuple
+        str: The user ID (UUID) for the authenticated user
 
     Raises:
-        HTTPException: If token is missing, invalid, or expired
-
-    Note:
-        FastAPI caches this dependency per-request, so multiple dependencies
-        that use this (get_current_user_jwt, get_current_user_id) only trigger
-        one JWT decode operation.
+        HTTPException 401: If token is missing, invalid, or expired
     """
     if not authorization:
         raise HTTPException(
@@ -84,7 +42,6 @@ async def get_validated_token_and_payload(
             detail="Missing authorization header"
         )
 
-    # Extract token from "Bearer <token>" format
     parts = authorization.split()
     if len(parts) != 2 or parts[0].lower() != "bearer":
         raise HTTPException(
@@ -95,81 +52,56 @@ async def get_validated_token_and_payload(
     token = parts[1]
 
     try:
-        payload = _decode_jwt(token)
-        return token, payload
-
-    except jwt.ExpiredSignatureError:
+        pool = get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                'SELECT user_id FROM "session" WHERE token = $1 AND expires_at > NOW()',
+                token
+            )
+    except asyncpg.PostgresError as e:
+        logger.error(f"[auth] DB error validating session: {e}")
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token has expired"
-        )
-    except jwt.InvalidAudienceError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid token audience"
-        )
-    except jwt.InvalidAlgorithmError as e:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=str(e)
-        )
-    except jwt.DecodeError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid JWT token"
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Authentication service unavailable"
         )
 
-
-async def get_current_user_jwt(
-    token_and_payload: Tuple[str, Dict[str, Any]] = Depends(get_validated_token_and_payload)
-) -> str:
-    """
-    Extract and validate the Supabase JWT from the Authorization header.
-
-    Returns:
-        str: The validated JWT token (for use with Supabase authenticated client)
-    """
-    return token_and_payload[0]
-
-
-async def get_current_user_id(
-    token_and_payload: Tuple[str, Dict[str, Any]] = Depends(get_validated_token_and_payload)
-) -> str:
-    """
-    Extract the user ID from the validated Supabase JWT.
-
-    Returns:
-        str: The user ID from the JWT token
-
-    Raises:
-        HTTPException: If user ID is missing from token
-    """
-    payload = token_and_payload[1]
-    user_id = payload.get("sub")
-
-    if not user_id:
+    if not row:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid token: missing user ID"
+            detail="Invalid or expired session token"
         )
 
+    user_id = str(row["user_id"])
     sentry_sdk.set_user({"id": user_id})
     return user_id
 
 
-async def get_optional_user_jwt(
+async def get_db(
+    user_id: str = Depends(get_current_user_id)
+) -> AsyncGenerator[asyncpg.Connection, None]:
+    """
+    FastAPI dependency that yields an authenticated asyncpg connection.
+
+    Sets app.current_user_id on the connection so all RLS policies resolve
+    correctly for the authenticated user.
+
+    Usage:
+        @router.get("/items")
+        async def list_items(conn: asyncpg.Connection = Depends(get_db)):
+            rows = await conn.fetch("SELECT * FROM items")
+    """
+    async with get_db_conn(user_id) as conn:
+        yield conn
+
+
+async def get_optional_user_id(
     authorization: Optional[str] = Header(None)
 ) -> Optional[str]:
     """
-    Extract the Supabase JWT from the Authorization header.
-    Returns None if not present (doesn't raise an error).
+    Extract user ID from token if present, without raising on missing token.
+    Returns None if no valid token is provided.
 
-    Note:
-        This does NOT validate the token - use only when auth is optional
-        and you'll validate later if token is present.
-
-    Returns:
-        Optional[str]: The JWT token or None
+    Use for endpoints where auth is optional.
     """
     if not authorization:
         return None
@@ -178,4 +110,14 @@ async def get_optional_user_jwt(
     if len(parts) != 2 or parts[0].lower() != "bearer":
         return None
 
-    return parts[1]
+    token = parts[1]
+    try:
+        pool = get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                'SELECT user_id FROM "session" WHERE token = $1 AND expires_at > NOW()',
+                token
+            )
+        return str(row["user_id"]) if row else None
+    except Exception:
+        return None

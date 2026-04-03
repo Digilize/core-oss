@@ -10,10 +10,10 @@ import asyncio
 import logging
 import uuid
 
-from api.dependencies import get_current_user_jwt, get_current_user_id
+from api.dependencies import get_current_user_id, get_db
 from api.config import settings
 from lib.r2_client import get_r2_client
-from lib.supabase_client import get_authenticated_async_client
+import asyncpg
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/chat/attachments", tags=["chat-attachments"])
@@ -114,8 +114,8 @@ def generate_chat_attachment_key(user_id: str, conversation_id: str, filename: s
 @router.post("/upload-url", response_model=AttachmentUploadResponse)
 async def get_presigned_upload_urls(
     request: AttachmentUploadRequest,
-    user_jwt: str = Depends(get_current_user_jwt),
     user_id: str = Depends(get_current_user_id),
+    conn: asyncpg.Connection = Depends(get_db),
 ):
     """
     Get presigned URLs for uploading image and thumbnail to R2.
@@ -128,31 +128,28 @@ async def get_presigned_upload_urls(
 
     The presigned URL bypasses the backend for efficient uploads.
     """
-    supabase = await get_authenticated_async_client(user_jwt)
     r2_client = get_r2_client()
 
-    # Verify conversation exists and belongs to user
-    conv_check = await supabase.table("conversations")\
-        .select("id")\
-        .eq("id", request.conversation_id)\
-        .eq("user_id", user_id)\
-        .execute()
+    # Verify conversation exists and belongs to user (RLS enforced via get_db)
+    conv_row = await conn.fetchrow(
+        "SELECT id FROM conversations WHERE id = $1 AND user_id = $2",
+        request.conversation_id,
+        user_id,
+    )
 
-    if not conv_check.data:
+    if not conv_row:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Conversation not found"
         )
 
     # Check pending uploads count for this conversation (prevent abuse)
-    pending_check = await supabase.table("chat_attachments")\
-        .select("id", count="exact")\
-        .eq("conversation_id", request.conversation_id)\
-        .eq("status", "uploading")\
-        .execute()
+    pending_count = await conn.fetchval(
+        "SELECT COUNT(*) FROM chat_attachments WHERE conversation_id = $1 AND status = 'uploading'",
+        request.conversation_id,
+    )
 
-    pending_count = pending_check.count or 0
-    if pending_count >= settings.chat_attachment_max_per_message * 2:  # Allow some buffer
+    if (pending_count or 0) >= settings.chat_attachment_max_per_message * 2:
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail="Too many pending uploads. Please complete or cancel existing uploads."
@@ -170,29 +167,33 @@ async def get_presigned_upload_urls(
 
         # Create attachment record with status='uploading'
         attachment_id = str(uuid.uuid4())
-        insert_result = await supabase.table("chat_attachments")\
-            .insert({
-                "id": attachment_id,
-                "user_id": user_id,
-                "conversation_id": request.conversation_id,
-                "filename": request.filename,
-                "mime_type": request.content_type,
-                "file_size": request.file_size,
-                "width": request.width,
-                "height": request.height,
-                "r2_key": original_key,
-                "thumbnail_r2_key": thumbnail_key,
-                "status": "uploading",
-            })\
-            .execute()
+        row = await conn.fetchrow(
+            """
+            INSERT INTO chat_attachments
+                (id, user_id, conversation_id, filename, mime_type, file_size, width, height,
+                 r2_key, thumbnail_r2_key, status)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'uploading')
+            RETURNING id
+            """,
+            attachment_id,
+            user_id,
+            request.conversation_id,
+            request.filename,
+            request.content_type,
+            request.file_size,
+            request.width,
+            request.height,
+            original_key,
+            thumbnail_key,
+        )
 
-        if not insert_result.data:
+        if not row:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="Failed to create attachment record"
             )
 
-        logger.info(f"📤 Chat attachment upload initiated: {attachment_id} for user {user_id}")
+        logger.info(f"Chat attachment upload initiated: {attachment_id} for user {user_id}")
 
         return AttachmentUploadResponse(
             attachment_id=attachment_id,
@@ -211,14 +212,7 @@ async def get_presigned_upload_urls(
         raise
     except Exception as e:
         error_str = str(e)
-        logger.error(f"❌ Error generating chat attachment URLs: {error_str}")
-
-        if 'JWT expired' in error_str or 'PGRST303' in error_str:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Your session has expired. Please sign in again."
-            )
-
+        logger.error(f"Error generating chat attachment URLs: {error_str}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to generate upload URLs: {error_str}"
@@ -228,8 +222,8 @@ async def get_presigned_upload_urls(
 @router.post("/{attachment_id}/confirm", response_model=AttachmentConfirmResponse)
 async def confirm_attachment_upload(
     attachment_id: str,
-    user_jwt: str = Depends(get_current_user_jwt),
     user_id: str = Depends(get_current_user_id),
+    conn: asyncpg.Connection = Depends(get_db),
 ):
     """
     Confirm image was uploaded successfully to R2.
@@ -241,23 +235,22 @@ async def confirm_attachment_upload(
 
     Call this after successfully uploading both files to their presigned URLs.
     """
-    supabase = await get_authenticated_async_client(user_jwt)
     r2_client = get_r2_client()
 
     # Get attachment record
-    attachment_result = await supabase.table("chat_attachments")\
-        .select("*")\
-        .eq("id", attachment_id)\
-        .eq("user_id", user_id)\
-        .execute()
+    attachment = await conn.fetchrow(
+        "SELECT * FROM chat_attachments WHERE id = $1 AND user_id = $2",
+        attachment_id,
+        user_id,
+    )
 
-    if not attachment_result.data:
+    if not attachment:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Attachment not found"
         )
 
-    attachment = attachment_result.data[0]
+    attachment = dict(attachment)
 
     if attachment["status"] == "uploaded":
         # Already confirmed, return current state
@@ -273,23 +266,20 @@ async def confirm_attachment_upload(
                 r2_key=attachment["r2_key"],
                 thumbnail_r2_key=attachment.get("thumbnail_r2_key"),
                 status=attachment["status"],
-                created_at=attachment["created_at"],
+                created_at=str(attachment["created_at"]),
             )
         )
 
     try:
-        # Get actual file size from R2 (also verifies file exists)
-        # We trust presigned URL uploads - if client says it uploaded, we just verify with metadata
-        # This is 1 HEAD request instead of 3, saving ~200-400ms
+        # Verify original file exists in R2
         metadata = await asyncio.to_thread(r2_client.get_object_metadata, attachment["r2_key"])
 
         if not metadata:
             # Original file doesn't exist - mark as error
-            await supabase.table("chat_attachments")\
-                .update({"status": "error"})\
-                .eq("id", attachment_id)\
-                .execute()
-
+            await conn.execute(
+                "UPDATE chat_attachments SET status = 'error' WHERE id = $1",
+                attachment_id,
+            )
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Original file not found in storage. Please re-upload."
@@ -298,31 +288,34 @@ async def confirm_attachment_upload(
         actual_size = metadata.get("content_length", attachment["file_size"])
 
         # Update status to uploaded
-        update_result = await supabase.table("chat_attachments")\
-            .update({
-                "status": "uploaded",
-                "file_size": actual_size,
-            })\
-            .eq("id", attachment_id)\
-            .execute()
+        updated = await conn.fetchrow(
+            """
+            UPDATE chat_attachments
+            SET status = 'uploaded', file_size = $1
+            WHERE id = $2
+            RETURNING *
+            """,
+            actual_size,
+            attachment_id,
+        )
 
-        updated_attachment = update_result.data[0]
+        updated = dict(updated)
 
-        logger.info(f"✅ Chat attachment confirmed: {attachment_id}")
+        logger.info(f"Chat attachment confirmed: {attachment_id}")
 
         return AttachmentConfirmResponse(
             attachment=AttachmentMetadata(
-                id=updated_attachment["id"],
-                conversation_id=updated_attachment["conversation_id"],
-                filename=updated_attachment["filename"],
-                mime_type=updated_attachment["mime_type"],
-                file_size=updated_attachment["file_size"],
-                width=updated_attachment.get("width"),
-                height=updated_attachment.get("height"),
-                r2_key=updated_attachment["r2_key"],
-                thumbnail_r2_key=updated_attachment.get("thumbnail_r2_key"),
-                status=updated_attachment["status"],
-                created_at=updated_attachment["created_at"],
+                id=updated["id"],
+                conversation_id=updated["conversation_id"],
+                filename=updated["filename"],
+                mime_type=updated["mime_type"],
+                file_size=updated["file_size"],
+                width=updated.get("width"),
+                height=updated.get("height"),
+                r2_key=updated["r2_key"],
+                thumbnail_r2_key=updated.get("thumbnail_r2_key"),
+                status=updated["status"],
+                created_at=str(updated["created_at"]),
             )
         )
 
@@ -330,14 +323,7 @@ async def confirm_attachment_upload(
         raise
     except Exception as e:
         error_str = str(e)
-        logger.error(f"❌ Error confirming chat attachment: {error_str}")
-
-        if 'JWT expired' in error_str or 'PGRST303' in error_str:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Your session has expired. Please sign in again."
-            )
-
+        logger.error(f"Error confirming chat attachment: {error_str}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to confirm upload: {error_str}"
@@ -348,8 +334,8 @@ async def confirm_attachment_upload(
 async def get_attachment_download_url(
     attachment_id: str,
     thumbnail: bool = False,
-    user_jwt: str = Depends(get_current_user_jwt),
     user_id: str = Depends(get_current_user_id),
+    conn: asyncpg.Connection = Depends(get_db),
 ):
     """
     Get a presigned URL for viewing an attachment.
@@ -360,23 +346,22 @@ async def get_attachment_download_url(
 
     The URL expires after 1 hour by default.
     """
-    supabase = await get_authenticated_async_client(user_jwt)
     r2_client = get_r2_client()
 
     # Get attachment record
-    attachment_result = await supabase.table("chat_attachments")\
-        .select("r2_key, thumbnail_r2_key, status, user_id")\
-        .eq("id", attachment_id)\
-        .eq("user_id", user_id)\
-        .execute()
+    attachment = await conn.fetchrow(
+        "SELECT r2_key, thumbnail_r2_key, status, user_id FROM chat_attachments WHERE id = $1 AND user_id = $2",
+        attachment_id,
+        user_id,
+    )
 
-    if not attachment_result.data:
+    if not attachment:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Attachment not found"
         )
 
-    attachment = attachment_result.data[0]
+    attachment = dict(attachment)
 
     if attachment["status"] != "uploaded":
         raise HTTPException(
@@ -391,7 +376,7 @@ async def get_attachment_download_url(
         expiry = settings.chat_attachment_download_expiry
         url = r2_client.get_presigned_url(r2_key, expiry)
 
-        logger.info(f"🔗 Generated download URL for attachment {attachment_id} (thumbnail={thumbnail})")
+        logger.info(f"Generated download URL for attachment {attachment_id} (thumbnail={thumbnail})")
 
         return AttachmentURLResponse(
             url=url,
@@ -400,14 +385,7 @@ async def get_attachment_download_url(
 
     except Exception as e:
         error_str = str(e)
-        logger.error(f"❌ Error getting attachment URL: {error_str}")
-
-        if 'JWT expired' in error_str or 'PGRST303' in error_str:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Your session has expired. Please sign in again."
-            )
-
+        logger.error(f"Error getting attachment URL: {error_str}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to get download URL: {error_str}"
@@ -417,8 +395,8 @@ async def get_attachment_download_url(
 @router.delete("/{attachment_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_attachment(
     attachment_id: str,
-    user_jwt: str = Depends(get_current_user_jwt),
     user_id: str = Depends(get_current_user_id),
+    conn: asyncpg.Connection = Depends(get_db),
 ):
     """
     Delete an attachment and its files from R2.
@@ -427,23 +405,22 @@ async def delete_attachment(
     - Canceling an upload before sending
     - Removing an attachment from a staged message
     """
-    supabase = await get_authenticated_async_client(user_jwt)
     r2_client = get_r2_client()
 
     # Get attachment record
-    attachment_result = await supabase.table("chat_attachments")\
-        .select("r2_key, thumbnail_r2_key, message_id")\
-        .eq("id", attachment_id)\
-        .eq("user_id", user_id)\
-        .execute()
+    attachment = await conn.fetchrow(
+        "SELECT r2_key, thumbnail_r2_key, message_id FROM chat_attachments WHERE id = $1 AND user_id = $2",
+        attachment_id,
+        user_id,
+    )
 
-    if not attachment_result.data:
+    if not attachment:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Attachment not found"
         )
 
-    attachment = attachment_result.data[0]
+    attachment = dict(attachment)
 
     # Don't allow deleting if already attached to a message
     if attachment.get("message_id"):
@@ -466,26 +443,19 @@ async def delete_attachment(
                 pass
 
         # Delete from database
-        await supabase.table("chat_attachments")\
-            .delete()\
-            .eq("id", attachment_id)\
-            .execute()
+        await conn.execute(
+            "DELETE FROM chat_attachments WHERE id = $1",
+            attachment_id,
+        )
 
-        logger.info(f"🗑️ Deleted chat attachment: {attachment_id}")
+        logger.info(f"Deleted chat attachment: {attachment_id}")
         return None
 
     except HTTPException:
         raise
     except Exception as e:
         error_str = str(e)
-        logger.error(f"❌ Error deleting attachment: {error_str}")
-
-        if 'JWT expired' in error_str or 'PGRST303' in error_str:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Your session has expired. Please sign in again."
-            )
-
+        logger.error(f"Error deleting attachment: {error_str}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to delete attachment: {error_str}"
@@ -496,8 +466,8 @@ async def delete_attachment(
 async def list_conversation_attachments(
     conversation_id: str,
     status_filter: Optional[str] = None,
-    user_jwt: str = Depends(get_current_user_jwt),
     user_id: str = Depends(get_current_user_id),
+    conn: asyncpg.Connection = Depends(get_db),
 ):
     """
     List all attachments for a conversation.
@@ -508,31 +478,31 @@ async def list_conversation_attachments(
 
     Returns attachments ordered by created_at desc.
     """
-    supabase = await get_authenticated_async_client(user_jwt)
-
     # Verify conversation belongs to user
-    conv_check = await supabase.table("conversations")\
-        .select("id")\
-        .eq("id", conversation_id)\
-        .eq("user_id", user_id)\
-        .execute()
+    conv_row = await conn.fetchrow(
+        "SELECT id FROM conversations WHERE id = $1 AND user_id = $2",
+        conversation_id,
+        user_id,
+    )
 
-    if not conv_check.data:
+    if not conv_row:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Conversation not found"
         )
 
     try:
-        query = supabase.table("chat_attachments")\
-            .select("*")\
-            .eq("conversation_id", conversation_id)\
-            .order("created_at", desc=True)
-
         if status_filter:
-            query = query.eq("status", status_filter)
-
-        result = await query.execute()
+            rows = await conn.fetch(
+                "SELECT * FROM chat_attachments WHERE conversation_id = $1 AND status = $2 ORDER BY created_at DESC",
+                conversation_id,
+                status_filter,
+            )
+        else:
+            rows = await conn.fetch(
+                "SELECT * FROM chat_attachments WHERE conversation_id = $1 ORDER BY created_at DESC",
+                conversation_id,
+            )
 
         return [
             AttachmentMetadata(
@@ -546,21 +516,14 @@ async def list_conversation_attachments(
                 r2_key=att["r2_key"],
                 thumbnail_r2_key=att.get("thumbnail_r2_key"),
                 status=att["status"],
-                created_at=att["created_at"],
+                created_at=str(att["created_at"]),
             )
-            for att in (result.data or [])
+            for att in rows
         ]
 
     except Exception as e:
         error_str = str(e)
-        logger.error(f"❌ Error listing attachments: {error_str}")
-
-        if 'JWT expired' in error_str or 'PGRST303' in error_str:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Your session has expired. Please sign in again."
-            )
-
+        logger.error(f"Error listing attachments: {error_str}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to list attachments: {error_str}"

@@ -1,46 +1,42 @@
 """
 Reorder documents service.
 Uses RPC function for atomic batch updates in a single transaction,
-avoiding N individual UPDATE statements that each trigger a Supabase
-Realtime event.
+avoiding N individual UPDATE statements that each trigger a Realtime event.
 """
 import asyncio
 import logging
 from typing import Any, Dict, List
 
-from supabase import AsyncClient
-
-from lib.supabase_client import get_authenticated_async_client
+import asyncpg
 
 logger = logging.getLogger(__name__)
 
 
 async def reorder_documents(
-    user_id: str, user_jwt: str, document_positions: List[Dict[str, Any]]
+    user_id: str, conn: asyncpg.Connection, document_positions: List[Dict[str, Any]]
 ) -> List[dict]:
     """
     Reorder multiple documents at once using RPC for atomicity.
 
     Args:
         user_id: ID of the user performing the reorder
-        user_jwt: User's Supabase JWT for authenticated requests
+        conn: Authenticated asyncpg connection (RLS already set for this user)
         document_positions: List of {"id": document_id, "position": new_position}
 
     Returns:
         Updated document records for compatibility with existing clients
     """
-    supabase = await get_authenticated_async_client(user_jwt)
     document_ids = [item.get("id") for item in document_positions if item.get("id")]
     if not document_ids:
         return []
 
     try:
-        result = await supabase.rpc(
-            "reorder_documents",
-            {"p_document_positions": document_positions},
-        ).execute()
-
-        updated_count = result.data if result.data else 0
+        import json
+        result_row = await conn.fetchrow(
+            "SELECT reorder_documents($1::jsonb) AS updated_count",
+            json.dumps(document_positions),
+        )
+        updated_count = result_row["updated_count"] if result_row else 0
         logger.info(f"Reordered {updated_count} documents for user {user_id} via RPC")
 
     except Exception as e:
@@ -50,14 +46,14 @@ async def reorder_documents(
                 "RPC reorder_documents not available, falling back to individual updates"
             )
             updated_count = await _reorder_documents_fallback(
-                user_id, supabase, document_positions
+                user_id, conn, document_positions
             )
             logger.info(f"Reordered {updated_count} documents for user {user_id} (fallback)")
         else:
             logger.exception(f"Error reordering documents for user {user_id}: {e}")
             raise
 
-    documents = await _fetch_documents_by_ids(supabase, document_ids)
+    documents = await _fetch_documents_by_ids(conn, document_ids)
     logger.info(
         f"Returning {len(documents)} reordered document records for user {user_id}"
     )
@@ -66,7 +62,7 @@ async def reorder_documents(
 
 async def _reorder_documents_fallback(
     user_id: str,
-    supabase: AsyncClient,
+    conn: asyncpg.Connection,
     document_positions: List[Dict[str, Any]],
 ) -> int:
     """Fallback: update positions individually in parallel (non-atomic)."""
@@ -76,13 +72,12 @@ async def _reorder_documents_fallback(
         position = item.get("position")
         if doc_id is None or position is None:
             return False
-        result = await (
-            supabase.table("documents")
-            .update({"position": position})
-            .eq("id", doc_id)
-            .execute()
+        row = await conn.fetchrow(
+            "UPDATE documents SET position = $1 WHERE id = $2 RETURNING id",
+            position,
+            doc_id,
         )
-        return bool(result.data)
+        return row is not None
 
     results = await asyncio.gather(*[update_one(item) for item in document_positions])
     updated_count = sum(1 for r in results if r)
@@ -92,17 +87,34 @@ async def _reorder_documents_fallback(
 
 
 async def _fetch_documents_by_ids(
-    supabase: AsyncClient,
+    conn: asyncpg.Connection,
     document_ids: List[str],
 ) -> List[dict]:
     """Fetch reordered documents and preserve request order."""
-    result = await (
-        supabase.table("documents")
-        .select("*, file:files(*)")
-        .in_("id", document_ids)
-        .execute()
+    from api.services.documents.get_documents import _row_to_doc
+
+    rows = await conn.fetch(
+        """
+        SELECT
+            d.*,
+            f.id          AS file__id,
+            f.user_id     AS file__user_id,
+            f.workspace_id AS file__workspace_id,
+            f.workspace_app_id AS file__workspace_app_id,
+            f.filename    AS file__filename,
+            f.file_type   AS file__file_type,
+            f.file_size   AS file__file_size,
+            f.r2_key      AS file__r2_key,
+            f.status      AS file__status,
+            f.created_at  AS file__created_at,
+            f.uploaded_at AS file__uploaded_at
+        FROM documents d
+        LEFT JOIN files f ON f.id = d.file_id
+        WHERE d.id = ANY($1::uuid[])
+        """,
+        document_ids,
     )
-    documents = result.data or []
+    documents = [_row_to_doc(r) for r in rows]
     index_map = {doc_id: idx for idx, doc_id in enumerate(document_ids)}
-    documents.sort(key=lambda doc: index_map.get(doc.get("id"), len(index_map)))
+    documents.sort(key=lambda doc: index_map.get(str(doc.get("id")), len(index_map)))
     return documents

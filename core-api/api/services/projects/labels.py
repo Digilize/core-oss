@@ -1,42 +1,38 @@
 """
 Label service - CRUD operations for project board labels and issue-label assignments.
 
-Uses async Supabase client for non-blocking I/O.
+Uses asyncpg for non-blocking I/O.
 """
 from typing import Dict, Any, List, Optional
 import logging
-from lib.supabase_client import get_authenticated_async_client
+import asyncpg
 
 logger = logging.getLogger(__name__)
 
 
 async def get_labels(
-    user_jwt: str,
+    conn: asyncpg.Connection,
     board_id: str,
 ) -> List[Dict[str, Any]]:
     """
     Get all labels for a board, ordered by name.
 
     Args:
-        user_jwt: User's Supabase JWT
+        conn: asyncpg connection
         board_id: Board UUID
 
     Returns:
         List of label dicts
     """
-    supabase = await get_authenticated_async_client(user_jwt)
-
-    result = await supabase.table("project_labels")\
-        .select("*")\
-        .eq("board_id", board_id)\
-        .order("name")\
-        .execute()
-
-    return result.data or []
+    rows = await conn.fetch(
+        "SELECT * FROM project_labels WHERE board_id = $1 ORDER BY name",
+        board_id,
+    )
+    return [dict(r) for r in rows]
 
 
 async def create_label(
-    user_jwt: str,
+    conn: asyncpg.Connection,
     user_id: str,
     board_id: str,
     name: str,
@@ -46,7 +42,7 @@ async def create_label(
     Create a label definition on a board.
 
     Args:
-        user_jwt: User's Supabase JWT
+        conn: asyncpg connection
         user_id: Creator's user ID
         board_id: Board UUID
         name: Label name
@@ -55,37 +51,35 @@ async def create_label(
     Returns:
         Created label dict
     """
-    supabase = await get_authenticated_async_client(user_jwt)
-
     # Look up board context
-    board_result = await supabase.table("project_boards")\
-        .select("workspace_app_id, workspace_id")\
-        .eq("id", board_id)\
-        .maybe_single()\
-        .execute()
-    board = board_result.data
-    if not board:
+    board_row = await conn.fetchrow(
+        "SELECT workspace_app_id, workspace_id FROM project_boards WHERE id = $1",
+        board_id,
+    )
+    if not board_row:
         raise ValueError(f"Board not found: {board_id}")
 
-    label_data: Dict[str, Any] = {
-        "workspace_app_id": board["workspace_app_id"],
-        "workspace_id": board["workspace_id"],
-        "board_id": board_id,
-        "name": name,
-        "color": color,
-        "created_by": user_id,
-    }
-
-    result = await supabase.table("project_labels")\
-        .insert(label_data)\
-        .execute()
+    row = await conn.fetchrow(
+        """
+        INSERT INTO project_labels
+            (workspace_app_id, workspace_id, board_id, name, color, created_by)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        RETURNING *
+        """,
+        board_row["workspace_app_id"],
+        board_row["workspace_id"],
+        board_id,
+        name,
+        color,
+        user_id,
+    )
 
     logger.info(f"Created label '{name}' on board {board_id}")
-    return result.data[0]
+    return dict(row)
 
 
 async def update_label(
-    user_jwt: str,
+    conn: asyncpg.Connection,
     label_id: str,
     name: Optional[str] = None,
     color: Optional[str] = None,
@@ -94,7 +88,7 @@ async def update_label(
     Update a label's name and/or color.
 
     Args:
-        user_jwt: User's Supabase JWT
+        conn: asyncpg connection
         label_id: Label UUID
         name: New name (optional)
         color: New color (optional)
@@ -102,8 +96,6 @@ async def update_label(
     Returns:
         Updated label dict
     """
-    supabase = await get_authenticated_async_client(user_jwt)
-
     updates: Dict[str, Any] = {}
     if name is not None:
         updates["name"] = name
@@ -111,82 +103,83 @@ async def update_label(
         updates["color"] = color
 
     if not updates:
-        result = await supabase.table("project_labels")\
-            .select("*")\
-            .eq("id", label_id)\
-            .single()\
-            .execute()
-        return result.data
+        row = await conn.fetchrow(
+            "SELECT * FROM project_labels WHERE id = $1",
+            label_id,
+        )
+        if not row:
+            raise ValueError(f"Label not found: {label_id}")
+        return dict(row)
 
-    result = await supabase.table("project_labels")\
-        .update(updates)\
-        .eq("id", label_id)\
-        .execute()
+    set_parts = []
+    values = []
+    for i, (col, val) in enumerate(updates.items(), start=1):
+        set_parts.append(f"{col} = ${i}")
+        values.append(val)
+    values.append(label_id)
 
-    if not result.data:
+    row = await conn.fetchrow(
+        f"UPDATE project_labels SET {', '.join(set_parts)} WHERE id = ${len(values)} RETURNING *",
+        *values,
+    )
+
+    if not row:
         raise ValueError(f"Label not found: {label_id}")
 
-    return result.data[0]
+    return dict(row)
 
 
 async def delete_label(
-    user_jwt: str,
+    conn: asyncpg.Connection,
     label_id: str,
 ) -> Dict[str, Any]:
     """
     Delete a label. Cascades to remove from all issues.
 
     Args:
-        user_jwt: User's Supabase JWT
+        conn: asyncpg connection
         label_id: Label UUID
 
     Returns:
         Status dict
     """
-    supabase = await get_authenticated_async_client(user_jwt)
-
-    await supabase.table("project_labels")\
-        .delete()\
-        .eq("id", label_id)\
-        .execute()
+    await conn.execute(
+        "DELETE FROM project_labels WHERE id = $1",
+        label_id,
+    )
 
     logger.info(f"Deleted label {label_id}")
     return {"status": "deleted", "label_id": label_id}
 
 
 async def get_issue_labels(
-    user_jwt: str,
+    conn: asyncpg.Connection,
     issue_id: str,
 ) -> List[Dict[str, Any]]:
     """
     Get all labels attached to an issue.
 
     Args:
-        user_jwt: User's Supabase JWT
+        conn: asyncpg connection
         issue_id: Issue UUID
 
     Returns:
         List of label dicts (from project_labels via junction)
     """
-    supabase = await get_authenticated_async_client(user_jwt)
-
-    result = await supabase.table("project_issue_labels")\
-        .select("label_id, project_labels(*)")\
-        .eq("issue_id", issue_id)\
-        .execute()
-
-    # Extract the nested label objects
-    labels = []
-    for row in (result.data or []):
-        label = row.get("project_labels")
-        if label:
-            labels.append(label)
-
-    return labels
+    rows = await conn.fetch(
+        """
+        SELECT pl.*
+        FROM project_issue_labels pil
+        JOIN project_labels pl ON pl.id = pil.label_id
+        WHERE pil.issue_id = $1
+        """,
+        issue_id,
+    )
+    return [dict(r) for r in rows]
 
 
 async def add_label_to_issue(
-    user_jwt: str,
+    conn: asyncpg.Connection,
     issue_id: str,
     label_id: str,
 ) -> Dict[str, Any]:
@@ -194,42 +187,40 @@ async def add_label_to_issue(
     Add a label to an issue.
 
     Args:
-        user_jwt: User's Supabase JWT
+        conn: asyncpg connection
         issue_id: Issue UUID
         label_id: Label UUID
 
     Returns:
         Created junction row
     """
-    supabase = await get_authenticated_async_client(user_jwt)
-
     # Look up issue context
-    issue_result = await supabase.table("project_issues")\
-        .select("workspace_app_id, workspace_id")\
-        .eq("id", issue_id)\
-        .maybe_single()\
-        .execute()
-    issue = issue_result.data
-    if not issue:
+    issue_row = await conn.fetchrow(
+        "SELECT workspace_app_id, workspace_id FROM project_issues WHERE id = $1",
+        issue_id,
+    )
+    if not issue_row:
         raise ValueError(f"Issue not found: {issue_id}")
 
-    junction_data: Dict[str, Any] = {
-        "workspace_app_id": issue["workspace_app_id"],
-        "workspace_id": issue["workspace_id"],
-        "issue_id": issue_id,
-        "label_id": label_id,
-    }
-
-    result = await supabase.table("project_issue_labels")\
-        .insert(junction_data)\
-        .execute()
+    row = await conn.fetchrow(
+        """
+        INSERT INTO project_issue_labels
+            (workspace_app_id, workspace_id, issue_id, label_id)
+        VALUES ($1, $2, $3, $4)
+        RETURNING *
+        """,
+        issue_row["workspace_app_id"],
+        issue_row["workspace_id"],
+        issue_id,
+        label_id,
+    )
 
     logger.info(f"Added label {label_id} to issue {issue_id}")
-    return result.data[0]
+    return dict(row)
 
 
 async def remove_label_from_issue(
-    user_jwt: str,
+    conn: asyncpg.Connection,
     issue_id: str,
     label_id: str,
 ) -> Dict[str, Any]:
@@ -237,20 +228,18 @@ async def remove_label_from_issue(
     Remove a label from an issue.
 
     Args:
-        user_jwt: User's Supabase JWT
+        conn: asyncpg connection
         issue_id: Issue UUID
         label_id: Label UUID
 
     Returns:
         Status dict
     """
-    supabase = await get_authenticated_async_client(user_jwt)
-
-    await supabase.table("project_issue_labels")\
-        .delete()\
-        .eq("issue_id", issue_id)\
-        .eq("label_id", label_id)\
-        .execute()
+    await conn.execute(
+        "DELETE FROM project_issue_labels WHERE issue_id = $1 AND label_id = $2",
+        issue_id,
+        label_id,
+    )
 
     logger.info(f"Removed label {label_id} from issue {issue_id}")
     return {"status": "removed", "issue_id": issue_id, "label_id": label_id}

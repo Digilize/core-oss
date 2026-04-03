@@ -1,8 +1,8 @@
 """Delete file service - handles file deletion from R2 and database."""
 
+import asyncpg
 import logging
 
-from lib.supabase_client import get_authenticated_async_client
 from lib.r2_client import get_r2_client
 
 logger = logging.getLogger(__name__)
@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 
 async def delete_file(
     user_id: str,
-    user_jwt: str,
+    conn: asyncpg.Connection,
     file_id: str,
 ) -> bool:
     """
@@ -22,7 +22,7 @@ async def delete_file(
 
     Args:
         user_id: The ID of the user deleting the file
-        user_jwt: The user's JWT token for authentication
+        conn: Authenticated asyncpg connection (RLS already set for this user)
         file_id: The ID of the file to delete
 
     Returns:
@@ -31,38 +31,40 @@ async def delete_file(
     Raises:
         Exception: If deletion fails or not authorized
     """
-    supabase = await get_authenticated_async_client(user_jwt)
-
-    logger.info(f"🗑️ Deleting file {file_id} for user {user_id}")
+    logger.info(f"Deleting file {file_id} for user {user_id}")
 
     # Delete any documents that reference this file first
     # RLS will enforce authorization
-    doc_response = await supabase.table("documents").delete().eq("file_id", file_id).execute()
-    if doc_response.data:
-        logger.info(f"✅ Deleted {len(doc_response.data)} document(s) referencing file")
+    deleted_docs = await conn.fetch(
+        "DELETE FROM documents WHERE file_id = $1 RETURNING id",
+        file_id,
+    )
+    if deleted_docs:
+        logger.info(f"Deleted {len(deleted_docs)} document(s) referencing file")
 
     # Delete file metadata from database FIRST
-    # RLS enforces authorization - only owner or workspace admin can delete
-    # PostgREST returns the deleted row, so we get r2_key from response
-    delete_response = await supabase.table("files").delete().eq("id", file_id).execute()
+    # RLS enforces authorization — only owner or workspace admin can delete
+    deleted_row = await conn.fetchrow(
+        "DELETE FROM files WHERE id = $1 RETURNING id, r2_key",
+        file_id,
+    )
 
-    if not delete_response.data:
+    if not deleted_row:
         # RLS blocked the delete (not authorized) or file not found
         raise Exception(f"Failed to delete file: {file_id} (not found or not authorized)")
 
-    # DB delete succeeded - now safe to delete from R2
-    deleted_file = delete_response.data[0]
-    r2_key = deleted_file.get("r2_key")
+    # DB delete succeeded — now safe to delete from R2
+    r2_key = deleted_row["r2_key"]
 
     if r2_key:
         try:
             r2_client = get_r2_client()
             r2_client.delete_file(r2_key)
-            logger.info(f"✅ Deleted file from R2: {r2_key}")
+            logger.info(f"Deleted file from R2: {r2_key}")
         except Exception as e:
-            # Log but don't fail - DB record is already deleted
+            # Log but don't fail — DB record is already deleted
             # Orphaned R2 files can be cleaned up separately
-            logger.error(f"❌ Failed to delete from R2 (DB already deleted): {e}")
+            logger.error(f"Failed to delete from R2 (DB already deleted): {e}")
 
-    logger.info(f"✅ File deleted successfully: {file_id}")
+    logger.info(f"File deleted successfully: {file_id}")
     return True

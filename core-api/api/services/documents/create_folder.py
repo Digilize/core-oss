@@ -1,6 +1,6 @@
 """Service for creating folders."""
 from typing import Optional
-from lib.supabase_client import get_authenticated_async_client
+import asyncpg
 import logging
 
 logger = logging.getLogger(__name__)
@@ -8,7 +8,7 @@ logger = logging.getLogger(__name__)
 
 async def create_folder(
     user_id: str,
-    user_jwt: str,
+    conn: asyncpg.Connection,
     workspace_app_id: str,
     title: str = "New Folder",
     parent_id: Optional[str] = None,
@@ -19,7 +19,7 @@ async def create_folder(
 
     Args:
         user_id: User ID who owns the folder
-        user_jwt: User's Supabase JWT for authenticated requests
+        conn: Authenticated asyncpg connection (RLS already set for this user)
         workspace_app_id: Workspace app ID (files app)
         title: Folder title
         parent_id: Optional parent folder ID for nesting
@@ -28,43 +28,42 @@ async def create_folder(
     Returns:
         The created folder record
     """
-    auth_supabase = await get_authenticated_async_client(user_jwt)
-
     try:
         # Lookup workspace_id from workspace_app
-        app_result = await auth_supabase.table("workspace_apps")\
-            .select("workspace_id")\
-            .eq("id", workspace_app_id)\
-            .single()\
-            .execute()
+        app_row = await conn.fetchrow(
+            "SELECT workspace_id FROM workspace_apps WHERE id = $1",
+            workspace_app_id,
+        )
 
-        if not app_result.data:
+        if not app_row:
             raise ValueError("Workspace app not found")
 
-        workspace_id = app_result.data["workspace_id"]
+        workspace_id = app_row["workspace_id"]
 
-        folder_data = {
-            "user_id": user_id,
-            "workspace_app_id": workspace_app_id,
-            "workspace_id": workspace_id,
-            "title": title,
-            "content": "",  # Folders don't have content
-            "type": "folder",  # Explicit type (defaults to 'note' otherwise)
-            "position": position,
-        }
+        folder_row = await conn.fetchrow(
+            """
+            INSERT INTO documents
+                (user_id, workspace_app_id, workspace_id, title, content,
+                 type, position, parent_id)
+            VALUES
+                ($1, $2, $3, $4, '', 'folder', $5, $6)
+            RETURNING *
+            """,
+            user_id,
+            workspace_app_id,
+            workspace_id,
+            title,
+            position,
+            parent_id,
+        )
 
-        if parent_id is not None:
-            folder_data["parent_id"] = parent_id
-
-        result = await auth_supabase.table("documents").insert(folder_data).execute()
-
-        if not result.data:
+        if not folder_row:
             raise Exception("Failed to create folder")
-        
-        logger.info(f"Created folder {result.data[0]['id']} for user {user_id}")
-        return result.data[0]
-        
+
+        result = dict(folder_row)
+        logger.info(f"Created folder {result['id']} for user {user_id}")
+        return result
+
     except Exception as e:
         logger.error(f"Error creating folder: {str(e)}")
         raise
-

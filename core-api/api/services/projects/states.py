@@ -1,42 +1,38 @@
 """
 State service - CRUD operations for project board states/columns.
 
-Uses async Supabase client for non-blocking I/O.
+Uses asyncpg for non-blocking I/O.
 """
 from typing import Dict, Any, List, Optional
 import logging
-from lib.supabase_client import get_authenticated_async_client
+import asyncpg
 
 logger = logging.getLogger(__name__)
 
 
 async def get_states(
-    user_jwt: str,
+    conn: asyncpg.Connection,
     board_id: str,
 ) -> List[Dict[str, Any]]:
     """
     Get all states for a board, ordered by position.
 
     Args:
-        user_jwt: User's Supabase JWT
+        conn: asyncpg connection
         board_id: Board UUID
 
     Returns:
         List of state dicts
     """
-    supabase = await get_authenticated_async_client(user_jwt)
-
-    result = await supabase.table("project_states")\
-        .select("*")\
-        .eq("board_id", board_id)\
-        .order("position")\
-        .execute()
-
-    return result.data or []
+    rows = await conn.fetch(
+        "SELECT * FROM project_states WHERE board_id = $1 ORDER BY position",
+        board_id,
+    )
+    return [dict(r) for r in rows]
 
 
 async def create_state(
-    user_jwt: str,
+    conn: asyncpg.Connection,
     board_id: str,
     name: str,
     color: Optional[str] = None,
@@ -46,7 +42,7 @@ async def create_state(
     Create a new state in a board.
 
     Args:
-        user_jwt: User's Supabase JWT
+        conn: asyncpg connection
         board_id: Board UUID
         name: State name
         color: Optional color (hex)
@@ -55,41 +51,40 @@ async def create_state(
     Returns:
         Created state dict
     """
-    supabase = await get_authenticated_async_client(user_jwt)
-
     # Look up board to get workspace context
-    board_result = await supabase.table("project_boards")\
-        .select("workspace_app_id, workspace_id")\
-        .eq("id", board_id)\
-        .single()\
-        .execute()
-    board = board_result.data
+    board_row = await conn.fetchrow(
+        "SELECT workspace_app_id, workspace_id FROM project_boards WHERE id = $1",
+        board_id,
+    )
+    if not board_row:
+        raise ValueError(f"Board not found: {board_id}")
 
     # Get next position
-    position = await _get_next_state_position(supabase, board_id)
+    position = await _get_next_state_position(conn, board_id)
 
-    state_data: Dict[str, Any] = {
-        "workspace_app_id": board["workspace_app_id"],
-        "workspace_id": board["workspace_id"],
-        "board_id": board_id,
-        "name": name,
-        "position": position,
-        "is_done": is_done,
-    }
-    if color is not None:
-        state_data["color"] = color
-
-    result = await supabase.table("project_states")\
-        .insert(state_data)\
-        .execute()
+    row = await conn.fetchrow(
+        """
+        INSERT INTO project_states
+            (workspace_app_id, workspace_id, board_id, name, color, position, is_done)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        RETURNING *
+        """,
+        board_row["workspace_app_id"],
+        board_row["workspace_id"],
+        board_id,
+        name,
+        color,
+        position,
+        is_done,
+    )
 
     logger.info(f"Created state '{name}' in board {board_id}")
 
-    return result.data[0]
+    return dict(row)
 
 
 async def update_state(
-    user_jwt: str,
+    conn: asyncpg.Connection,
     state_id: str,
     name: Optional[str] = None,
     color: Optional[str] = None,
@@ -99,7 +94,7 @@ async def update_state(
     Update a state's fields.
 
     Args:
-        user_jwt: User's Supabase JWT
+        conn: asyncpg connection
         state_id: State UUID
         name: New name (optional)
         color: New color (optional)
@@ -108,8 +103,6 @@ async def update_state(
     Returns:
         Updated state dict
     """
-    supabase = await get_authenticated_async_client(user_jwt)
-
     updates: Dict[str, Any] = {}
     if name is not None:
         updates["name"] = name
@@ -119,44 +112,50 @@ async def update_state(
         updates["is_done"] = is_done
 
     if not updates:
-        result = await supabase.table("project_states")\
-            .select("*")\
-            .eq("id", state_id)\
-            .single()\
-            .execute()
-        return result.data
+        row = await conn.fetchrow(
+            "SELECT * FROM project_states WHERE id = $1",
+            state_id,
+        )
+        if not row:
+            raise ValueError(f"State not found: {state_id}")
+        return dict(row)
 
-    result = await supabase.table("project_states")\
-        .update(updates)\
-        .eq("id", state_id)\
-        .execute()
+    set_parts = []
+    values = []
+    for i, (col, val) in enumerate(updates.items(), start=1):
+        set_parts.append(f"{col} = ${i}")
+        values.append(val)
+    values.append(state_id)
 
-    if not result.data:
+    row = await conn.fetchrow(
+        f"UPDATE project_states SET {', '.join(set_parts)} WHERE id = ${len(values)} RETURNING *",
+        *values,
+    )
+
+    if not row:
         raise ValueError(f"State not found: {state_id}")
 
-    return result.data[0]
+    return dict(row)
 
 
 async def delete_state(
-    user_jwt: str,
+    conn: asyncpg.Connection,
     state_id: str,
 ) -> Dict[str, Any]:
     """
     Delete a state. Will fail if issues still reference it (RESTRICT).
 
     Args:
-        user_jwt: User's Supabase JWT
+        conn: asyncpg connection
         state_id: State UUID
 
     Returns:
         Status dict
     """
-    supabase = await get_authenticated_async_client(user_jwt)
-
-    await supabase.table("project_states")\
-        .delete()\
-        .eq("id", state_id)\
-        .execute()
+    await conn.execute(
+        "DELETE FROM project_states WHERE id = $1",
+        state_id,
+    )
 
     logger.info(f"Deleted state {state_id}")
 
@@ -164,7 +163,7 @@ async def delete_state(
 
 
 async def reorder_states(
-    user_jwt: str,
+    conn: asyncpg.Connection,
     board_id: str,
     items: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
@@ -172,22 +171,22 @@ async def reorder_states(
     Reorder states within a board using RPC for atomicity.
 
     Args:
-        user_jwt: User's Supabase JWT
+        conn: asyncpg connection
         board_id: Board UUID
         items: List of {"id": "uuid", "position": int}
 
     Returns:
         Dict with updated_count
     """
-    supabase = await get_authenticated_async_client(user_jwt)
-
     try:
-        result = await supabase.rpc(
-            "reorder_project_states",
-            {"p_board_id": board_id, "p_items": items}
-        ).execute()
+        import json
+        row = await conn.fetchrow(
+            "SELECT reorder_project_states($1, $2)",
+            board_id,
+            json.dumps(items),
+        )
 
-        updated_count = result.data if result.data else 0
+        updated_count = row[0] if row and row[0] else 0
 
         logger.info(f"Reordered {updated_count} states in board {board_id}")
 
@@ -198,29 +197,26 @@ async def reorder_states(
     except Exception as e:
         if "does not exist" in str(e).lower():
             logger.warning("RPC reorder_project_states not available, using fallback")
-            return await _reorder_states_fallback(supabase, board_id, items)
+            return await _reorder_states_fallback(conn, board_id, items)
         raise
 
 
 async def _get_next_state_position(
-    supabase: Any,
+    conn: asyncpg.Connection,
     board_id: str,
 ) -> int:
     """Get the next position for a new state in the board."""
-    result = await supabase.table("project_states")\
-        .select("position")\
-        .eq("board_id", board_id)\
-        .order("position", desc=True)\
-        .limit(1)\
-        .execute()
-
-    if result.data:
-        return result.data[0]["position"] + 1
+    row = await conn.fetchrow(
+        "SELECT position FROM project_states WHERE board_id = $1 ORDER BY position DESC LIMIT 1",
+        board_id,
+    )
+    if row:
+        return row["position"] + 1
     return 0
 
 
 async def _reorder_states_fallback(
-    supabase: Any,
+    conn: asyncpg.Connection,
     board_id: str,
     items: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
@@ -228,12 +224,13 @@ async def _reorder_states_fallback(
     import asyncio
 
     async def update_one(item: Dict[str, Any]) -> bool:
-        result = await supabase.table("project_states")\
-            .update({"position": item["position"]})\
-            .eq("id", item["id"])\
-            .eq("board_id", board_id)\
-            .execute()
-        return bool(result.data)
+        result = await conn.execute(
+            "UPDATE project_states SET position = $1 WHERE id = $2 AND board_id = $3",
+            item["position"],
+            item["id"],
+            board_id,
+        )
+        return result == "UPDATE 1"
 
     results = await asyncio.gather(*[update_one(item) for item in items])
     updated_count = sum(1 for r in results if r)

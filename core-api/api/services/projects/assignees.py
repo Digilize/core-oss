@@ -1,11 +1,11 @@
 """
 Assignee service - operations for project issue multi-assignee management.
 
-Uses async Supabase client for non-blocking I/O.
+Uses asyncpg for non-blocking I/O.
 """
 from typing import Dict, Any, List, Optional
 import logging
-from lib.supabase_client import get_authenticated_async_client
+import asyncpg
 from api.services.notifications.subscriptions import subscribe
 from api.services.notifications.create import create_notification, NotificationType
 from api.services.notifications.helpers import get_actor_info
@@ -14,32 +14,28 @@ logger = logging.getLogger(__name__)
 
 
 async def get_issue_assignees(
-    user_jwt: str,
+    conn: asyncpg.Connection,
     issue_id: str,
 ) -> List[Dict[str, Any]]:
     """
     Get all assignees for an issue.
 
     Args:
-        user_jwt: User's Supabase JWT
+        conn: asyncpg connection
         issue_id: Issue UUID
 
     Returns:
         List of assignee dicts with user_id and created_at
     """
-    supabase = await get_authenticated_async_client(user_jwt)
-
-    result = await supabase.table("project_issue_assignees")\
-        .select("*")\
-        .eq("issue_id", issue_id)\
-        .order("created_at")\
-        .execute()
-
-    return result.data or []
+    rows = await conn.fetch(
+        "SELECT * FROM project_issue_assignees WHERE issue_id = $1 ORDER BY created_at",
+        issue_id,
+    )
+    return [dict(r) for r in rows]
 
 
 async def add_assignee(
-    user_jwt: str,
+    conn: asyncpg.Connection,
     issue_id: str,
     user_id: str,
     current_user_id: Optional[str] = None,
@@ -48,7 +44,7 @@ async def add_assignee(
     Add an assignee to an issue. DB trigger enforces max 10.
 
     Args:
-        user_jwt: User's Supabase JWT
+        conn: asyncpg connection
         issue_id: Issue UUID
         user_id: User UUID to assign
         current_user_id: Who is performing the action (for notifications)
@@ -56,28 +52,27 @@ async def add_assignee(
     Returns:
         Created assignee row
     """
-    supabase = await get_authenticated_async_client(user_jwt)
-
     # Look up issue context
-    issue_result = await supabase.table("project_issues")\
-        .select("workspace_app_id, workspace_id, title, board_id")\
-        .eq("id", issue_id)\
-        .maybe_single()\
-        .execute()
-    issue = issue_result.data
-    if not issue:
+    issue_row = await conn.fetchrow(
+        "SELECT workspace_app_id, workspace_id, title, board_id FROM project_issues WHERE id = $1",
+        issue_id,
+    )
+    if not issue_row:
         raise ValueError(f"Issue not found: {issue_id}")
+    issue = dict(issue_row)
 
-    assignee_data: Dict[str, Any] = {
-        "workspace_app_id": issue["workspace_app_id"],
-        "workspace_id": issue["workspace_id"],
-        "issue_id": issue_id,
-        "user_id": user_id,
-    }
-
-    result = await supabase.table("project_issue_assignees")\
-        .insert(assignee_data)\
-        .execute()
+    row = await conn.fetchrow(
+        """
+        INSERT INTO project_issue_assignees
+            (workspace_app_id, workspace_id, issue_id, user_id)
+        VALUES ($1, $2, $3, $4)
+        RETURNING *
+        """,
+        issue["workspace_app_id"],
+        issue["workspace_id"],
+        issue_id,
+        user_id,
+    )
 
     logger.info(f"Added assignee {user_id} to issue {issue_id}")
 
@@ -104,11 +99,11 @@ async def add_assignee(
     except Exception as e:
         logger.warning(f"Notification failed for assignee add: {e}")
 
-    return result.data[0]
+    return dict(row)
 
 
 async def remove_assignee(
-    user_jwt: str,
+    conn: asyncpg.Connection,
     issue_id: str,
     user_id: str,
 ) -> Dict[str, Any]:
@@ -116,20 +111,18 @@ async def remove_assignee(
     Remove an assignee from an issue.
 
     Args:
-        user_jwt: User's Supabase JWT
+        conn: asyncpg connection
         issue_id: Issue UUID
         user_id: User UUID to remove
 
     Returns:
         Status dict
     """
-    supabase = await get_authenticated_async_client(user_jwt)
-
-    await supabase.table("project_issue_assignees")\
-        .delete()\
-        .eq("issue_id", issue_id)\
-        .eq("user_id", user_id)\
-        .execute()
+    await conn.execute(
+        "DELETE FROM project_issue_assignees WHERE issue_id = $1 AND user_id = $2",
+        issue_id,
+        user_id,
+    )
 
     logger.info(f"Removed assignee {user_id} from issue {issue_id}")
     return {"status": "removed", "issue_id": issue_id, "user_id": user_id}

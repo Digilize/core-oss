@@ -4,15 +4,16 @@ from typing import List, Optional, Dict, Any
 from pydantic import BaseModel, Field, field_validator
 from zoneinfo import ZoneInfo
 from uuid import UUID
-from api.dependencies import get_current_user_id, get_current_user_jwt
+from api.dependencies import get_current_user_id, get_current_user_jwt, get_db
 from api.config import settings
 from api.rate_limit import limiter
-from lib.supabase_client import get_authenticated_async_client, get_async_service_role_client
+from lib.db import get_db_conn, get_admin_db_conn
 from lib.r2_client import get_r2_client
 from api.services.chat.claude_agent import stream_chat_response
 from api.services.chat.events import error_event, done_event
 from api.services.chat.content_builder import ContentBuilder, create_attachment_part
 from api.services.chat.title_generator import generate_and_update_title
+import asyncpg
 import json
 import logging
 import asyncio
@@ -137,111 +138,119 @@ class SendMessageRequest(BaseModel):
             raise ValueError(f"Maximum {settings.chat_attachment_max_per_message} attachments per message")
         return v
 
+
+def _row_to_dict(row) -> dict:
+    """Convert asyncpg Record to dict, stringifying non-serialisable types."""
+    d = dict(row)
+    for k, v in d.items():
+        if hasattr(v, 'isoformat'):  # datetime / date
+            d[k] = v.isoformat()
+    return d
+
+
 @router.get("/conversations", response_model=List[ConversationResponse])
 async def list_conversations(
-    user: Dict = Depends(get_current_user)
+    user: Dict = Depends(get_current_user),
+    conn: asyncpg.Connection = Depends(get_db),
 ):
     """List all conversations for the current user"""
-    supabase = await get_authenticated_async_client(user['jwt'])
-    
-    logger.info(f"💬 [CHAT SEARCH] User {user['id']} listing conversations")
-    
-    response = await supabase.table("conversations")\
-        .select("*")\
-        .eq("user_id", user['id'])\
-        .order("updated_at", desc=True)\
-        .execute()
-    
-    conversation_count = len(response.data) if response.data else 0
-    logger.info(f"💬 [CHAT SEARCH] Found {conversation_count} conversations for user {user['id']}")
-        
-    return response.data
+    logger.info(f"[CHAT SEARCH] User {user['id']} listing conversations")
+
+    rows = await conn.fetch(
+        "SELECT * FROM conversations WHERE user_id = $1 ORDER BY updated_at DESC",
+        user['id'],
+    )
+
+    conversations = [_row_to_dict(r) for r in rows]
+    logger.info(f"[CHAT SEARCH] Found {len(conversations)} conversations for user {user['id']}")
+    return conversations
+
 
 @router.post("/conversations", response_model=ConversationResponse)
 async def create_conversation(
     request: CreateConversationRequest,
-    user: Dict = Depends(get_current_user)
+    user: Dict = Depends(get_current_user),
+    conn: asyncpg.Connection = Depends(get_db),
 ):
     """Create a new conversation"""
-    supabase = await get_authenticated_async_client(user['jwt'])
-    
-    response = await supabase.table("conversations")\
-        .insert({
-            "user_id": user['id'],
-            "title": request.title
-        })\
-        .execute()
-        
-    if not response.data:
+    row = await conn.fetchrow(
+        "INSERT INTO conversations (user_id, title) VALUES ($1, $2) RETURNING *",
+        user['id'],
+        request.title,
+    )
+
+    if not row:
         raise HTTPException(status_code=500, detail="Failed to create conversation")
 
-    return response.data[0]
+    return _row_to_dict(row)
+
 
 @router.patch("/conversations/{conversation_id}", response_model=ConversationResponse)
 async def update_conversation(
     conversation_id: str,
     request: UpdateConversationRequest,
-    user: Dict = Depends(get_current_user)
+    user: Dict = Depends(get_current_user),
+    conn: asyncpg.Connection = Depends(get_db),
 ):
     """Update a conversation (rename)"""
-    supabase = await get_authenticated_async_client(user['jwt'])
-
     # Atomic update with ownership check
-    response = await supabase.table("conversations")\
-        .update({"title": request.title})\
-        .eq("id", conversation_id)\
-        .eq("user_id", user['id'])\
-        .execute()
+    row = await conn.fetchrow(
+        "UPDATE conversations SET title = $1 WHERE id = $2 AND user_id = $3 RETURNING *",
+        request.title,
+        conversation_id,
+        user['id'],
+    )
 
-    if not response.data:
+    if not row:
         raise HTTPException(status_code=404, detail="Conversation not found")
 
-    logger.info(f"💬 [CHAT] User {user['id']} renamed conversation {conversation_id} to '{request.title}'")
-    return response.data[0]
+    logger.info(f"[CHAT] User {user['id']} renamed conversation {conversation_id} to '{request.title}'")
+    return _row_to_dict(row)
+
 
 @router.delete("/conversations/{conversation_id}", response_model=ConversationDeleteResponse)
 async def delete_conversation(
     conversation_id: str,
-    user: Dict = Depends(get_current_user)
+    user: Dict = Depends(get_current_user),
+    conn: asyncpg.Connection = Depends(get_db),
 ):
     """Delete a conversation, all its messages, and clean up R2 attachments"""
-    supabase = await get_authenticated_async_client(user['jwt'])
     r2_client = get_r2_client()
 
     # Verify ownership
-    conv_check = await supabase.table("conversations")\
-        .select("id")\
-        .eq("id", conversation_id)\
-        .eq("user_id", user['id'])\
-        .execute()
+    conv_row = await conn.fetchrow(
+        "SELECT id FROM conversations WHERE id = $1 AND user_id = $2",
+        conversation_id,
+        user['id'],
+    )
 
-    if not conv_check.data:
+    if not conv_row:
         raise HTTPException(status_code=404, detail="Conversation not found")
 
     # Get all attachment R2 keys for this conversation (before cascade delete)
-    attachments_result = await supabase.table("chat_attachments")\
-        .select("r2_key, thumbnail_r2_key")\
-        .eq("conversation_id", conversation_id)\
-        .execute()
+    att_rows = await conn.fetch(
+        "SELECT r2_key, thumbnail_r2_key FROM chat_attachments WHERE conversation_id = $1",
+        conversation_id,
+    )
 
     r2_keys_to_delete = []
-    for att in (attachments_result.data or []):
+    for att in att_rows:
         if att.get("r2_key"):
             r2_keys_to_delete.append(att["r2_key"])
         if att.get("thumbnail_r2_key"):
             r2_keys_to_delete.append(att["thumbnail_r2_key"])
 
     # Delete messages first (foreign key constraint)
-    await supabase.table("messages")\
-        .delete()\
-        .eq("conversation_id", conversation_id)\
-        .execute()
+    await conn.execute(
+        "DELETE FROM messages WHERE conversation_id = $1",
+        conversation_id,
+    )
 
     # Delete conversation (cascades to chat_attachments)
-    await supabase.table("conversations")\
-        .delete()\
-        .eq("id", conversation_id)\
-        .execute()
+    await conn.execute(
+        "DELETE FROM conversations WHERE id = $1",
+        conversation_id,
+    )
 
     # Clean up R2 files (after DB delete to ensure consistency)
     for r2_key in r2_keys_to_delete:
@@ -251,39 +260,38 @@ async def delete_conversation(
             # Log but don't fail - orphaned files will be cleaned by cron
             logger.warning(f"Failed to delete R2 file {r2_key}: {e}")
 
-    logger.info(f"💬 [CHAT] User {user['id']} deleted conversation {conversation_id}")
+    logger.info(f"[CHAT] User {user['id']} deleted conversation {conversation_id}")
     return {"status": "deleted", "id": conversation_id}
+
 
 @router.get("/conversations/{conversation_id}/messages", response_model=List[MessageItemResponse])
 async def get_messages(
     conversation_id: str,
-    user: Dict = Depends(get_current_user)
+    user: Dict = Depends(get_current_user),
+    conn: asyncpg.Connection = Depends(get_db),
 ):
     """Get messages for a conversation"""
-    supabase = await get_authenticated_async_client(user['jwt'])
-    
     # Verify ownership
-    conv_check = await supabase.table("conversations")\
-        .select("id")\
-        .eq("id", conversation_id)\
-        .eq("user_id", user['id'])\
-        .execute()
-        
-    if not conv_check.data:
+    conv_row = await conn.fetchrow(
+        "SELECT id FROM conversations WHERE id = $1 AND user_id = $2",
+        conversation_id,
+        user['id'],
+    )
+
+    if not conv_row:
         raise HTTPException(status_code=404, detail="Conversation not found")
-    
-    logger.info(f"💬 [CHAT SEARCH] User {user['id']} retrieving messages for conversation {conversation_id}")
-        
-    response = await supabase.table("messages")\
-        .select("*")\
-        .eq("conversation_id", conversation_id)\
-        .order("created_at", desc=False)\
-        .execute()
-    
-    message_count = len(response.data) if response.data else 0
-    logger.info(f"💬 [CHAT SEARCH] Found {message_count} messages in conversation {conversation_id} for user {user['id']}")
-        
-    return response.data
+
+    logger.info(f"[CHAT SEARCH] User {user['id']} retrieving messages for conversation {conversation_id}")
+
+    rows = await conn.fetch(
+        "SELECT * FROM messages WHERE conversation_id = $1 ORDER BY created_at ASC",
+        conversation_id,
+    )
+
+    messages = [_row_to_dict(r) for r in rows]
+    logger.info(f"[CHAT SEARCH] Found {len(messages)} messages in conversation {conversation_id} for user {user['id']}")
+    return messages
+
 
 @router.post("/conversations/{conversation_id}/messages", responses={
     200: {
@@ -301,39 +309,43 @@ async def send_message(
     response: Response,
     conversation_id: str,
     body: SendMessageRequest,
-    user: Dict = Depends(get_current_user)
+    user: Dict = Depends(get_current_user),
+    conn: asyncpg.Connection = Depends(get_db),
 ):
     """Send a message and get a streaming response"""
-    supabase = await get_authenticated_async_client(user['jwt'])
-
     # Verify ownership
-    conv_check = await supabase.table("conversations")\
-        .select("id")\
-        .eq("id", conversation_id)\
-        .eq("user_id", user['id'])\
-        .execute()
+    conv_row = await conn.fetchrow(
+        "SELECT id FROM conversations WHERE id = $1 AND user_id = $2",
+        conversation_id,
+        user['id'],
+    )
 
-    if not conv_check.data:
+    if not conv_row:
         raise HTTPException(status_code=404, detail="Conversation not found")
 
     # Fetch and validate attachments if provided
     attachments = []
     if body.attachment_ids:
-        att_result = await supabase.table("chat_attachments")\
-            .select("*")\
-            .in_("id", body.attachment_ids)\
-            .eq("user_id", user['id'])\
-            .eq("conversation_id", conversation_id)\
-            .eq("status", "uploaded")\
-            .execute()
+        att_rows = await conn.fetch(
+            """
+            SELECT * FROM chat_attachments
+            WHERE id = ANY($1::uuid[])
+              AND user_id = $2
+              AND conversation_id = $3
+              AND status = 'uploaded'
+            """,
+            body.attachment_ids,
+            user['id'],
+            conversation_id,
+        )
 
-        if not att_result.data or len(att_result.data) != len(body.attachment_ids):
+        if len(att_rows) != len(body.attachment_ids):
             raise HTTPException(
                 status_code=400,
                 detail="One or more attachments not found or not uploaded"
             )
 
-        attachments = att_result.data
+        attachments = [_row_to_dict(r) for r in att_rows]
 
     # Build user message content_parts (attachments first, then text)
     user_content_parts = []
@@ -358,38 +370,46 @@ async def send_message(
         })
 
     # Save user message with content_parts
-    user_message_result = await supabase.table("messages")\
-        .insert({
-            "conversation_id": conversation_id,
-            "role": "user",
-            "content": body.content,
-            "content_parts": user_content_parts if user_content_parts else None,
-        })\
-        .execute()
+    user_msg_row = await conn.fetchrow(
+        """
+        INSERT INTO messages (conversation_id, role, content, content_parts)
+        VALUES ($1, 'user', $2, $3)
+        RETURNING id
+        """,
+        conversation_id,
+        body.content,
+        json.dumps(user_content_parts) if user_content_parts else None,
+    )
 
-    user_message_id = user_message_result.data[0]["id"] if user_message_result.data else None
+    user_message_id = user_msg_row["id"] if user_msg_row else None
 
     # Link attachments to the message
     if attachments and user_message_id:
         for att in attachments:
-            await supabase.table("chat_attachments")\
-                .update({"message_id": user_message_id})\
-                .eq("id", att["id"])\
-                .execute()
-        
+            await conn.execute(
+                "UPDATE chat_attachments SET message_id = $1 WHERE id = $2",
+                user_message_id,
+                att["id"],
+            )
+
     # Get conversation history for context
-    history_response = await supabase.table("messages")\
-        .select("role, content, content_parts")\
-        .eq("conversation_id", conversation_id)\
-        .order("created_at", desc=False)\
-        .execute()
-        
-    history = history_response.data or []
+    history_rows = await conn.fetch(
+        "SELECT role, content, content_parts FROM messages WHERE conversation_id = $1 ORDER BY created_at ASC",
+        conversation_id,
+    )
+
+    history = [_row_to_dict(r) for r in history_rows]
 
     # Format history for Claude API (reconstruct tool_use/tool_result pairs from stored content_parts)
     formatted_history = []
     for msg in history:
         content_parts = msg.get("content_parts") or []
+        # content_parts may be stored as a JSON string
+        if isinstance(content_parts, str):
+            try:
+                content_parts = json.loads(content_parts)
+            except Exception:
+                content_parts = []
         text_content = msg["content"] or ""
 
         # Check if this assistant message has tool_call parts (new format)
@@ -437,7 +457,7 @@ async def send_message(
                 "role": msg["role"],
                 "content": text_content
             })
-        
+
     # Build context dict if provided
     context_dict = None
     if body.context:
@@ -445,7 +465,14 @@ async def send_message(
             "emails": [email.model_dump() for email in body.context.emails] if body.context.emails else None,
             "documents": [doc.model_dump() for doc in body.context.documents] if body.context.documents else None
         }
-    
+
+    # Capture for use inside generator
+    _user_id = user['id']
+    _user_jwt = user['jwt']
+    _is_first_exchange = len(history) == 1
+    _user_content = body.content
+    effective_workspace_ids = body.workspace_ids or ([body.workspace_id] if body.workspace_id else None)
+
     async def generate():
         """
         Stream NDJSON events to client while building content_parts for database.
@@ -468,10 +495,8 @@ async def send_message(
         display_events = []  # Keep for legacy display_content column
 
         try:
-            logger.info(f"[CHAT] User {user['id']} sending message in conversation {conversation_id} (timezone: {body.timezone}, attachments: {len(attachments)})")
-            # Resolve workspace_ids: prefer new array field, fall back to legacy single field
-            effective_workspace_ids = body.workspace_ids or ([body.workspace_id] if body.workspace_id else None)
-            async for chunk in stream_chat_response(formatted_history, user['id'], user['jwt'], context_dict, body.timezone, attachments, effective_workspace_ids, is_disconnected=request.is_disconnected):
+            logger.info(f"[CHAT] User {_user_id} sending message in conversation {conversation_id} (timezone: {body.timezone}, attachments: {len(attachments)})")
+            async for chunk in stream_chat_response(formatted_history, _user_id, _user_jwt, context_dict, body.timezone, attachments, effective_workspace_ids, is_disconnected=request.is_disconnected):
                 # Parse NDJSON to build blocks with proper interleaving
                 stripped_chunk = chunk.strip()
                 if stripped_chunk:
@@ -550,37 +575,32 @@ async def send_message(
             # Save assistant message after stream completes
             assistant_message_id = ""
             if text_content or content_parts:
-                message_data = {
-                    "conversation_id": conversation_id,
-                    "role": "assistant",
-                    "content": text_content,  # Keep for search/fallback
-                    "content_parts": content_parts  # Source of truth with proper interleaving
-                }
-
-                result = await supabase.table("messages")\
-                    .insert(message_data)\
-                    .execute()
-
-                # Extract the message ID for the done event
-                if result.data and len(result.data) > 0:
-                    assistant_message_id = result.data[0].get("id", "")
-
-                # Touch conversation to trigger updated_at via DB trigger
-                await supabase.table("conversations")\
-                    .update({"id": conversation_id})\
-                    .eq("id", conversation_id)\
-                    .execute()
-
-                # Auto-generate title after first exchange (fire-and-forget)
-                # history has 1 entry = just the user message we saved = first exchange
-                if len(history) == 1 and body.content:
-                    asyncio.create_task(
-                        generate_and_update_title(
-                            conversation_id=conversation_id,
-                            user_message=body.content,
-                            supabase_client=supabase
-                        )
+                async with get_db_conn(_user_id) as stream_conn:
+                    row = await stream_conn.fetchrow(
+                        """
+                        INSERT INTO messages (conversation_id, role, content, content_parts)
+                        VALUES ($1, 'assistant', $2, $3)
+                        RETURNING id
+                        """,
+                        conversation_id,
+                        text_content,
+                        json.dumps(content_parts),
                     )
+                    if row:
+                        assistant_message_id = str(row["id"])
+
+                    # Touch conversation to trigger updated_at via DB trigger
+                    await stream_conn.execute(
+                        "UPDATE conversations SET id = id WHERE id = $1",
+                        conversation_id,
+                    )
+
+                    # Auto-generate title after first exchange (fire-and-forget)
+                    # history has 1 entry = just the user message we saved = first exchange
+                    if _is_first_exchange and _user_content:
+                        asyncio.create_task(
+                            _update_title_with_conn(conversation_id, _user_content, _user_id)
+                        )
 
             # Yield done event with message_id (for action persistence)
             yield done_event(assistant_message_id)
@@ -588,14 +608,24 @@ async def send_message(
         except Exception as e:
             logger.error(f"Error in chat stream: {e}", exc_info=True)
             yield error_event(f"Error: {type(e).__name__}: {e}")
-        finally:
-            # Clean up async client to prevent connection pool leaks on stream cancel
-            try:
-                await supabase.aclose()
-            except Exception:
-                pass  # Ignore cleanup errors
 
     return StreamingResponse(generate(), media_type="application/x-ndjson", headers=CHAT_STREAM_HEADERS)
+
+
+async def _update_title_with_conn(conversation_id: str, user_message: str, user_id: str) -> None:
+    """Fire-and-forget title generation that opens its own DB connection."""
+    from api.services.chat.title_generator import generate_title
+    try:
+        title = await generate_title(user_message)
+        if title:
+            async with get_db_conn(user_id) as conn:
+                await conn.execute(
+                    "UPDATE conversations SET title = $1 WHERE id = $2",
+                    title,
+                    conversation_id,
+                )
+    except Exception as e:
+        logger.warning(f"Failed to auto-generate title for conversation {conversation_id}: {e}")
 
 
 class RegenerateRequest(BaseModel):
@@ -625,48 +655,46 @@ async def regenerate_message(
     message_id: str,
     body: RegenerateRequest,
     raw_request: Request,
-    user: Dict = Depends(get_current_user)
+    user: Dict = Depends(get_current_user),
+    conn: asyncpg.Connection = Depends(get_db),
 ):
     """Delete the assistant message and regenerate a new response from the preceding context."""
-    supabase = await get_authenticated_async_client(user['jwt'])
-
     # Verify ownership
-    conv_check = await supabase.table("conversations") \
-        .select("id") \
-        .eq("id", conversation_id) \
-        .eq("user_id", user['id']) \
-        .execute()
-    if not conv_check.data:
+    conv_row = await conn.fetchrow(
+        "SELECT id FROM conversations WHERE id = $1 AND user_id = $2",
+        conversation_id,
+        user['id'],
+    )
+    if not conv_row:
         raise HTTPException(status_code=404, detail="Conversation not found")
 
     # Verify the target message exists and is an assistant message
-    msg_check = await supabase.table("messages") \
-        .select("id, role, created_at") \
-        .eq("id", message_id) \
-        .eq("conversation_id", conversation_id) \
-        .execute()
-    if not msg_check.data:
+    msg_row = await conn.fetchrow(
+        "SELECT id, role, created_at FROM messages WHERE id = $1 AND conversation_id = $2",
+        message_id,
+        conversation_id,
+    )
+    if not msg_row:
         raise HTTPException(status_code=404, detail="Message not found")
-    if msg_check.data[0]["role"] != "assistant":
+    if msg_row["role"] != "assistant":
         raise HTTPException(status_code=400, detail="Can only regenerate assistant messages")
 
-    target_created_at = msg_check.data[0]["created_at"]
+    target_created_at = msg_row["created_at"]
 
     # Delete the target message and any messages after it
-    await supabase.table("messages") \
-        .delete() \
-        .eq("conversation_id", conversation_id) \
-        .gte("created_at", target_created_at) \
-        .execute()
+    await conn.execute(
+        "DELETE FROM messages WHERE conversation_id = $1 AND created_at >= $2",
+        conversation_id,
+        target_created_at,
+    )
 
     # Get remaining conversation history
-    history_response = await supabase.table("messages") \
-        .select("role, content, content_parts") \
-        .eq("conversation_id", conversation_id) \
-        .order("created_at", desc=False) \
-        .execute()
+    history_rows = await conn.fetch(
+        "SELECT role, content, content_parts FROM messages WHERE conversation_id = $1 ORDER BY created_at ASC",
+        conversation_id,
+    )
 
-    history = history_response.data or []
+    history = [_row_to_dict(r) for r in history_rows]
     if not history:
         raise HTTPException(status_code=400, detail="No messages left to regenerate from")
 
@@ -674,6 +702,11 @@ async def regenerate_message(
     formatted_history = []
     for msg in history:
         content_parts = msg.get("content_parts") or []
+        if isinstance(content_parts, str):
+            try:
+                content_parts = json.loads(content_parts)
+            except Exception:
+                content_parts = []
         text_content = msg["content"] or ""
         tool_calls = [p for p in content_parts if p.get("type") == "tool_call"]
 
@@ -706,6 +739,8 @@ async def regenerate_message(
             formatted_history.append({"role": msg["role"], "content": text_content})
 
     effective_workspace_ids = body.workspace_ids
+    _user_id = user['id']
+    _user_jwt = user['jwt']
 
     async def generate():
         content_builder = ContentBuilder()
@@ -714,8 +749,8 @@ async def regenerate_message(
         display_events = []
 
         try:
-            logger.info(f"[CHAT] User {user['id']} regenerating message in conversation {conversation_id}")
-            async for chunk in stream_chat_response(formatted_history, user['id'], user['jwt'], None, body.timezone, None, None, effective_workspace_ids, is_disconnected=raw_request.is_disconnected):
+            logger.info(f"[CHAT] User {_user_id} regenerating message in conversation {conversation_id}")
+            async for chunk in stream_chat_response(formatted_history, _user_id, _user_jwt, None, body.timezone, None, None, effective_workspace_ids, is_disconnected=raw_request.is_disconnected):
                 stripped_chunk = chunk.strip()
                 if stripped_chunk:
                     try:
@@ -764,27 +799,25 @@ async def regenerate_message(
 
             assistant_message_id = ""
             if text_content or content_parts:
-                result = await supabase.table("messages") \
-                    .insert({
-                        "conversation_id": conversation_id,
-                        "role": "assistant",
-                        "content": text_content,
-                        "content_parts": content_parts,
-                    }) \
-                    .execute()
-                if result.data and len(result.data) > 0:
-                    assistant_message_id = result.data[0].get("id", "")
+                async with get_db_conn(_user_id) as stream_conn:
+                    row = await stream_conn.fetchrow(
+                        """
+                        INSERT INTO messages (conversation_id, role, content, content_parts)
+                        VALUES ($1, 'assistant', $2, $3)
+                        RETURNING id
+                        """,
+                        conversation_id,
+                        text_content,
+                        json.dumps(content_parts),
+                    )
+                    if row:
+                        assistant_message_id = str(row["id"])
 
             yield done_event(assistant_message_id)
 
         except Exception as e:
             logger.error(f"Error in regenerate stream: {e}", exc_info=True)
             yield error_event(f"Error: {type(e).__name__}: {e}")
-        finally:
-            try:
-                await supabase.aclose()
-            except Exception:
-                pass
 
     return StreamingResponse(generate(), media_type="application/x-ndjson", headers=CHAT_STREAM_HEADERS)
 
@@ -793,7 +826,7 @@ async def regenerate_message(
 async def execute_action(
     message_id: str,
     action_id: str,
-    user: Dict = Depends(get_current_user)
+    user: Dict = Depends(get_current_user),
 ):
     """
     Execute a staged action and update its status in the message's content_parts.
@@ -810,86 +843,90 @@ async def execute_action(
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid message ID format")
 
-    # Use service role client since we manually verify ownership below
-    # This bypasses RLS which may differ between prod/dev environments
-    supabase = await get_async_service_role_client()
+    # Use admin connection since we manually verify ownership below
+    async with get_admin_db_conn() as conn:
+        # Verify message exists and belongs to user's conversation
+        msg_row = await conn.fetchrow(
+            "SELECT id, conversation_id FROM messages WHERE id = $1",
+            message_id,
+        )
 
-    # Verify message exists and belongs to user's conversation
-    message_check = await supabase.table("messages")\
-        .select("id, conversation_id")\
-        .eq("id", message_id)\
-        .execute()
+        if not msg_row:
+            raise HTTPException(status_code=404, detail="Message not found")
 
-    if not message_check.data:
-        raise HTTPException(status_code=404, detail="Message not found")
+        conversation_id = msg_row["conversation_id"]
 
-    conversation_id = message_check.data[0]["conversation_id"]
+        # Verify user owns the conversation
+        conv_row = await conn.fetchrow(
+            "SELECT id FROM conversations WHERE id = $1 AND user_id = $2",
+            conversation_id,
+            user['id'],
+        )
 
-    # Verify user owns the conversation
-    conv_check = await supabase.table("conversations")\
-        .select("id")\
-        .eq("id", conversation_id)\
-        .eq("user_id", user['id'])\
-        .execute()
+        if not conv_row:
+            raise HTTPException(status_code=403, detail="Access denied")
 
-    if not conv_check.data:
-        raise HTTPException(status_code=403, detail="Access denied")
+        # Get current content_parts
+        content_row = await conn.fetchrow(
+            "SELECT content_parts FROM messages WHERE id = $1",
+            message_id,
+        )
 
-    # Get current content_parts
-    message_data = await supabase.table("messages")\
-        .select("content_parts")\
-        .eq("id", message_id)\
-        .execute()
+        if not content_row or not content_row["content_parts"]:
+            raise HTTPException(status_code=400, detail="Message has no content_parts")
 
-    if not message_data.data or not message_data.data[0].get("content_parts"):
-        raise HTTPException(status_code=400, detail="Message has no content_parts")
+        raw_parts = content_row["content_parts"]
+        if isinstance(raw_parts, str):
+            content_parts = json.loads(raw_parts)
+        else:
+            content_parts = list(raw_parts)
 
-    content_parts = message_data.data[0]["content_parts"]
+        # Find the action part
+        action_part = None
+        for part in content_parts:
+            if part.get("id") == action_id and part.get("type") == "action":
+                action_part = part
+                break
 
-    # Find the action part
-    action_part = None
-    for part in content_parts:
-        if part.get("id") == action_id and part.get("type") == "action":
-            action_part = part
-            break
+        if not action_part:
+            raise HTTPException(status_code=404, detail="Action not found in message")
 
-    if not action_part:
-        raise HTTPException(status_code=404, detail="Action not found in message")
+        action_data = action_part.get("data", {})
+        action_type = action_data.get("action", "")
+        # Tool args are nested in data.data (see content_builder.create_action_part)
+        tool_args = action_data.get("data", action_data)
 
-    action_data = action_part.get("data", {})
-    action_type = action_data.get("action", "")
-    # Tool args are nested in data.data (see content_builder.create_action_part)
-    tool_args = action_data.get("data", action_data)
+        # Execute the actual action
+        result_data = None
+        try:
+            result_data = await _execute_action(action_type, tool_args, user['id'], user['jwt'])
+            action_part["data"]["status"] = "executed"
+            if result_data:
+                action_part["data"]["result"] = result_data
+            logger.info(f"[ACTION] User {user['id']} executed {action_type} (action {action_id})")
+        except Exception as e:
+            action_part["data"]["status"] = "error"
+            action_part["data"]["error"] = str(e)
+            logger.error(f"[ACTION] Failed to execute {action_type} for user {user['id']}: {e}")
+            # Save the error status, then raise
+            await conn.execute(
+                "UPDATE messages SET content_parts = $1 WHERE id = $2",
+                json.dumps(content_parts),
+                message_id,
+            )
+            raise HTTPException(status_code=500, detail=f"Action failed: {str(e)}")
 
-    # Execute the actual action
-    result_data = None
-    try:
-        result_data = await _execute_action(action_type, tool_args, user['id'], user['jwt'])
-        action_part["data"]["status"] = "executed"
-        if result_data:
-            action_part["data"]["result"] = result_data
-        logger.info(f"✅ [ACTION] User {user['id']} executed {action_type} (action {action_id})")
-    except Exception as e:
-        action_part["data"]["status"] = "error"
-        action_part["data"]["error"] = str(e)
-        logger.error(f"❌ [ACTION] Failed to execute {action_type} for user {user['id']}: {e}")
-        # Save the error status, then raise
-        await supabase.table("messages")\
-            .update({"content_parts": content_parts})\
-            .eq("id", message_id)\
-            .execute()
-        raise HTTPException(status_code=500, detail=f"Action failed: {str(e)}")
+        # Save updated content_parts
+        await conn.execute(
+            "UPDATE messages SET content_parts = $1 WHERE id = $2",
+            json.dumps(content_parts),
+            message_id,
+        )
 
-    # Save updated content_parts
-    await supabase.table("messages")\
-        .update({"content_parts": content_parts})\
-        .eq("id", message_id)\
-        .execute()
-
-    response = {"success": True, "action_id": action_id, "status": "executed"}
+    response_body: Dict[str, Any] = {"success": True, "action_id": action_id, "status": "executed"}
     if result_data:
-        response["result"] = result_data
-    return response
+        response_body["result"] = result_data
+    return response_body
 
 
 # Thread pool for running sync service functions (create_event, send_email, etc.)

@@ -4,6 +4,7 @@ Documents router - HTTP endpoints for document operations
 from fastapi import APIRouter, HTTPException, status, Depends, Response, Query
 from typing import Optional, List
 from pydantic import BaseModel, Field
+import asyncpg
 from api.services.documents import (
     create_document,
     create_folder,
@@ -20,7 +21,7 @@ from api.services.documents import (
     get_version,
     restore_version,
 )
-from api.dependencies import get_current_user_jwt, get_current_user_id
+from api.dependencies import get_current_user_id, get_db
 from api.exceptions import handle_api_exception
 import logging
 
@@ -129,8 +130,8 @@ class DocumentVersionListResponse(BaseModel):
 @router.get("", response_model=DocumentListResponse)
 async def get_documents_endpoint(
     response: Response,
-    user_jwt: str = Depends(get_current_user_jwt),
     user_id: str = Depends(get_current_user_id),
+    conn: asyncpg.Connection = Depends(get_db),
     parent_id: Optional[str] = None,
     workspace_id: Optional[str] = Query(default=None, description="Filter by workspace ID"),
     workspace_app_id: Optional[str] = Query(default=None, description="Filter by workspace app ID"),
@@ -145,7 +146,6 @@ async def get_documents_endpoint(
 ):
     """
     Get documents for a user with optional filtering and sorting.
-    Requires: Authorization header with user's Supabase JWT
 
     Query params:
         workspace_id: Filter by workspace ID
@@ -167,10 +167,10 @@ async def get_documents_endpoint(
         if sort_direction not in valid_sort_direction:
             sort_direction = "desc"
 
-        logger.info(f"📄 Fetching documents for user {user_id} (sort: {sort_by} {sort_direction})")
+        logger.info(f"Fetching documents for user {user_id} (sort: {sort_by} {sort_direction})")
         documents = await get_documents(
             user_id=user_id,
-            user_jwt=user_jwt,
+            conn=conn,
             parent_id=parent_id,
             workspace_id=workspace_id,
             workspace_app_id=workspace_app_id,
@@ -185,7 +185,7 @@ async def get_documents_endpoint(
         )
         # Documents are user-specific and mutation-heavy; disable intermediary/browser caching.
         response.headers["Cache-Control"] = "private, no-store"
-        logger.info(f"✅ Fetched {len(documents)} documents")
+        logger.info(f"Fetched {len(documents)} documents")
         return {"documents": documents, "count": len(documents)}
     except Exception as e:
         handle_api_exception(e, "Failed to fetch documents", logger)
@@ -194,31 +194,35 @@ async def get_documents_endpoint(
 @router.get("/tags", response_model=DocumentTagsResponse)
 async def get_user_tags_endpoint(
     response: Response,
-    user_jwt: str = Depends(get_current_user_jwt),
     user_id: str = Depends(get_current_user_id),
+    conn: asyncpg.Connection = Depends(get_db),
 ):
     """
     Get all unique tags used by this user's documents.
-    Requires: Authorization header with user's Supabase JWT
 
     Returns:
         {"tags": ["Health & Fitness", "Education", ...]}
     """
-    from lib.supabase_client import get_authenticated_supabase_client
-
     try:
-        logger.info(f"🏷️ Fetching tags for user {user_id}")
-        supabase = get_authenticated_supabase_client(user_jwt)
+        logger.info(f"Fetching tags for user {user_id}")
 
-        # Use RPC function for efficient tag aggregation at database level
-        result = supabase.rpc("get_user_tags", {"p_user_id": user_id}).execute()
+        # Aggregate tags from the documents table using unnest
+        rows = await conn.fetch(
+            """
+            SELECT DISTINCT unnest(tags) AS tag
+            FROM documents
+            WHERE user_id = $1
+              AND tags IS NOT NULL
+              AND array_length(tags, 1) > 0
+            ORDER BY tag
+            """,
+            user_id,
+        )
 
-        # Extract tags from result (each row should have a "tag" field)
-        rows = result.data or []
-        tags_list = [row.get("tag") for row in rows if isinstance(row, dict) and row.get("tag")]
+        tags_list = [row["tag"] for row in rows if row["tag"]]
 
         response.headers["Cache-Control"] = "private, no-store"
-        logger.info(f"✅ Found {len(tags_list)} unique tags")
+        logger.info(f"Found {len(tags_list)} unique tags")
         return {"tags": tags_list}
     except Exception as e:
         handle_api_exception(e, "Failed to fetch tags", logger)
@@ -228,16 +232,15 @@ async def get_user_tags_endpoint(
 async def get_document_endpoint(
     document_id: str,
     response: Response,
-    user_jwt: str = Depends(get_current_user_jwt),
     user_id: str = Depends(get_current_user_id),
+    conn: asyncpg.Connection = Depends(get_db),
 ):
     """
     Get a specific document by ID.
-    Requires: Authorization header with user's Supabase JWT
     """
     try:
-        logger.info(f"📄 Fetching document {document_id} for user {user_id}")
-        document = await get_document_by_id(user_id=user_id, user_jwt=user_jwt, document_id=document_id)
+        logger.info(f"Fetching document {document_id} for user {user_id}")
+        document = await get_document_by_id(user_id=user_id, conn=conn, document_id=document_id)
 
         if not document:
             raise HTTPException(
@@ -247,7 +250,7 @@ async def get_document_endpoint(
 
         # Document reads must be fresh right after edits.
         response.headers["Cache-Control"] = "private, no-store"
-        logger.info(f"✅ Fetched document {document_id}")
+        logger.info(f"Fetched document {document_id}")
         return document
     except HTTPException:
         raise
@@ -258,18 +261,17 @@ async def get_document_endpoint(
 @router.post("", response_model=DocumentItemResponse, status_code=status.HTTP_201_CREATED)
 async def create_document_endpoint(
     request: CreateDocumentRequest,
-    user_jwt: str = Depends(get_current_user_jwt),
     user_id: str = Depends(get_current_user_id),
+    conn: asyncpg.Connection = Depends(get_db),
 ):
     """
     Create a new document.
-    Requires: Authorization header with user's Supabase JWT
     """
     try:
-        logger.info(f"📄 Creating document for user {user_id}")
+        logger.info(f"Creating document for user {user_id}")
         document = await create_document(
             user_id=user_id,
-            user_jwt=user_jwt,
+            conn=conn,
             workspace_app_id=request.workspace_app_id,
             title=request.title,
             content=request.content,
@@ -279,7 +281,7 @@ async def create_document_endpoint(
             position=request.position,
             tags=request.tags or [],
         )
-        logger.info(f"✅ Created document {document['id']}")
+        logger.info(f"Created document {document['id']}")
         return document
     except Exception as e:
         handle_api_exception(e, "Failed to create document", logger)
@@ -288,24 +290,23 @@ async def create_document_endpoint(
 @router.post("/folders", response_model=DocumentItemResponse, status_code=status.HTTP_201_CREATED)
 async def create_folder_endpoint(
     request: CreateFolderRequest,
-    user_jwt: str = Depends(get_current_user_jwt),
     user_id: str = Depends(get_current_user_id),
+    conn: asyncpg.Connection = Depends(get_db),
 ):
     """
     Create a new folder.
-    Requires: Authorization header with user's Supabase JWT
     """
     try:
-        logger.info(f"📁 Creating folder for user {user_id}")
+        logger.info(f"Creating folder for user {user_id}")
         folder = await create_folder(
             user_id=user_id,
-            user_jwt=user_jwt,
+            conn=conn,
             workspace_app_id=request.workspace_app_id,
             title=request.title,
             parent_id=request.parent_id,
             position=request.position,
         )
-        logger.info(f"✅ Created folder {folder['id']}")
+        logger.info(f"Created folder {folder['id']}")
         return folder
     except Exception as e:
         handle_api_exception(e, "Failed to create folder", logger)
@@ -315,15 +316,14 @@ async def create_folder_endpoint(
 async def update_document_endpoint(
     document_id: str,
     request: UpdateDocumentRequest,
-    user_jwt: str = Depends(get_current_user_jwt),
     user_id: str = Depends(get_current_user_id),
+    conn: asyncpg.Connection = Depends(get_db),
 ):
     """
     Update an existing document.
-    Requires: Authorization header with user's Supabase JWT
     """
     try:
-        logger.info(f"📄 Updating document {document_id} for user {user_id}")
+        logger.info(f"Updating document {document_id} for user {user_id}")
 
         # Use model_fields_set to check which fields were explicitly provided
         # This allows us to distinguish between "not provided" and "explicitly set to None"
@@ -331,7 +331,7 @@ async def update_document_endpoint(
 
         document = await update_document(
             user_id=user_id,
-            user_jwt=user_jwt,
+            conn=conn,
             document_id=document_id,
             title=request.title,
             content=request.content,
@@ -343,7 +343,7 @@ async def update_document_endpoint(
             parent_id_explicitly_set='parent_id' in fields_set,
             expected_updated_at=request.expected_updated_at,
         )
-        logger.info(f"✅ Updated document {document_id}")
+        logger.info(f"Updated document {document_id}")
         return document
     except Exception as e:
         handle_api_exception(e, "Failed to update document", logger, check_not_found=True)
@@ -352,17 +352,16 @@ async def update_document_endpoint(
 @router.delete("/{document_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_document_endpoint(
     document_id: str,
-    user_jwt: str = Depends(get_current_user_jwt),
     user_id: str = Depends(get_current_user_id),
+    conn: asyncpg.Connection = Depends(get_db),
 ):
     """
     Permanently delete a document.
-    Requires: Authorization header with user's Supabase JWT
     """
     try:
-        logger.info(f"📄 Deleting document {document_id} for user {user_id}")
-        await delete_document(user_id=user_id, user_jwt=user_jwt, document_id=document_id)
-        logger.info(f"✅ Deleted document {document_id}")
+        logger.info(f"Deleting document {document_id} for user {user_id}")
+        await delete_document(user_id=user_id, conn=conn, document_id=document_id)
+        logger.info(f"Deleted document {document_id}")
         return None
     except Exception as e:
         handle_api_exception(e, "Failed to delete document", logger, check_not_found=True)
@@ -371,17 +370,16 @@ async def delete_document_endpoint(
 @router.post("/{document_id}/archive", response_model=DocumentItemResponse)
 async def archive_document_endpoint(
     document_id: str,
-    user_jwt: str = Depends(get_current_user_jwt),
     user_id: str = Depends(get_current_user_id),
+    conn: asyncpg.Connection = Depends(get_db),
 ):
     """
     Archive a document (soft delete).
-    Requires: Authorization header with user's Supabase JWT
     """
     try:
-        logger.info(f"📄 Archiving document {document_id} for user {user_id}")
-        document = await archive_document(user_id=user_id, user_jwt=user_jwt, document_id=document_id)
-        logger.info(f"✅ Archived document {document_id}")
+        logger.info(f"Archiving document {document_id} for user {user_id}")
+        document = await archive_document(user_id=user_id, conn=conn, document_id=document_id)
+        logger.info(f"Archived document {document_id}")
         return document
     except Exception as e:
         handle_api_exception(e, "Failed to archive document", logger, check_not_found=True)
@@ -390,17 +388,16 @@ async def archive_document_endpoint(
 @router.post("/{document_id}/unarchive", response_model=DocumentItemResponse)
 async def unarchive_document_endpoint(
     document_id: str,
-    user_jwt: str = Depends(get_current_user_jwt),
     user_id: str = Depends(get_current_user_id),
+    conn: asyncpg.Connection = Depends(get_db),
 ):
     """
     Unarchive a document.
-    Requires: Authorization header with user's Supabase JWT
     """
     try:
-        logger.info(f"📄 Unarchiving document {document_id} for user {user_id}")
-        document = await unarchive_document(user_id=user_id, user_jwt=user_jwt, document_id=document_id)
-        logger.info(f"✅ Unarchived document {document_id}")
+        logger.info(f"Unarchiving document {document_id} for user {user_id}")
+        document = await unarchive_document(user_id=user_id, conn=conn, document_id=document_id)
+        logger.info(f"Unarchived document {document_id}")
         return document
     except Exception as e:
         handle_api_exception(e, "Failed to unarchive document", logger, check_not_found=True)
@@ -409,17 +406,16 @@ async def unarchive_document_endpoint(
 @router.post("/{document_id}/favorite", response_model=DocumentItemResponse)
 async def favorite_document_endpoint(
     document_id: str,
-    user_jwt: str = Depends(get_current_user_jwt),
     user_id: str = Depends(get_current_user_id),
+    conn: asyncpg.Connection = Depends(get_db),
 ):
     """
     Mark a document as favorite.
-    Requires: Authorization header with user's Supabase JWT
     """
     try:
-        logger.info(f"📄 Favoriting document {document_id} for user {user_id}")
-        document = await favorite_document(user_id=user_id, user_jwt=user_jwt, document_id=document_id)
-        logger.info(f"✅ Favorited document {document_id}")
+        logger.info(f"Favoriting document {document_id} for user {user_id}")
+        document = await favorite_document(user_id=user_id, conn=conn, document_id=document_id)
+        logger.info(f"Favorited document {document_id}")
         return document
     except Exception as e:
         handle_api_exception(e, "Failed to favorite document", logger, check_not_found=True)
@@ -428,17 +424,16 @@ async def favorite_document_endpoint(
 @router.post("/{document_id}/unfavorite", response_model=DocumentItemResponse)
 async def unfavorite_document_endpoint(
     document_id: str,
-    user_jwt: str = Depends(get_current_user_jwt),
     user_id: str = Depends(get_current_user_id),
+    conn: asyncpg.Connection = Depends(get_db),
 ):
     """
     Remove favorite mark from a document.
-    Requires: Authorization header with user's Supabase JWT
     """
     try:
-        logger.info(f"📄 Unfavoriting document {document_id} for user {user_id}")
-        document = await unfavorite_document(user_id=user_id, user_jwt=user_jwt, document_id=document_id)
-        logger.info(f"✅ Unfavorited document {document_id}")
+        logger.info(f"Unfavoriting document {document_id} for user {user_id}")
+        document = await unfavorite_document(user_id=user_id, conn=conn, document_id=document_id)
+        logger.info(f"Unfavorited document {document_id}")
         return document
     except Exception as e:
         handle_api_exception(e, "Failed to unfavorite document", logger, check_not_found=True)
@@ -451,16 +446,15 @@ async def unfavorite_document_endpoint(
 @router.get("/{document_id}/versions", response_model=DocumentVersionListResponse)
 async def list_versions_endpoint(
     document_id: str,
-    user_jwt: str = Depends(get_current_user_jwt),
     user_id: str = Depends(get_current_user_id),
+    conn: asyncpg.Connection = Depends(get_db),
 ):
     """
     List all versions for a document (without content).
-    Requires: Authorization header with user's Supabase JWT
     """
     try:
         logger.info(f"Listing versions for document {document_id}")
-        versions = await list_versions(document_id=document_id, user_jwt=user_jwt)
+        versions = await list_versions(document_id=document_id, conn=conn)
         return {"versions": versions, "count": len(versions)}
     except Exception as e:
         handle_api_exception(e, "Failed to list document versions", logger)
@@ -470,17 +464,16 @@ async def list_versions_endpoint(
 async def get_version_endpoint(
     document_id: str,
     version_id: str,
-    user_jwt: str = Depends(get_current_user_jwt),
     user_id: str = Depends(get_current_user_id),
+    conn: asyncpg.Connection = Depends(get_db),
 ):
     """
     Get a specific version with full content.
-    Requires: Authorization header with user's Supabase JWT
     """
     try:
         logger.info(f"Fetching version {version_id} for document {document_id}")
         version = await get_version(
-            document_id=document_id, version_id=version_id, user_jwt=user_jwt
+            document_id=document_id, version_id=version_id, conn=conn
         )
         if not version:
             raise HTTPException(
@@ -498,13 +491,12 @@ async def get_version_endpoint(
 async def restore_version_endpoint(
     document_id: str,
     version_id: str,
-    user_jwt: str = Depends(get_current_user_jwt),
     user_id: str = Depends(get_current_user_id),
+    conn: asyncpg.Connection = Depends(get_db),
 ):
     """
     Restore a document to a previous version.
     The current content is automatically snapshotted before restoring.
-    Requires: Authorization header with user's Supabase JWT
     """
     try:
         logger.info(f"Restoring document {document_id} to version {version_id}")
@@ -512,7 +504,7 @@ async def restore_version_endpoint(
             document_id=document_id,
             version_id=version_id,
             user_id=user_id,
-            user_jwt=user_jwt,
+            conn=conn,
         )
         logger.info(f"Restored document {document_id}")
         return document
@@ -528,19 +520,18 @@ async def restore_version_endpoint(
 @router.post("/reorder", response_model=DocumentListResponse)
 async def reorder_documents_endpoint(
     request: ReorderDocumentsRequest,
-    user_jwt: str = Depends(get_current_user_jwt),
     user_id: str = Depends(get_current_user_id),
+    conn: asyncpg.Connection = Depends(get_db),
 ):
     """
     Reorder multiple documents at once.
-    Requires: Authorization header with user's Supabase JWT
     """
     try:
-        logger.info(f"📄 Reordering documents for user {user_id}")
+        logger.info(f"Reordering documents for user {user_id}")
         documents = await reorder_documents(
-            user_id=user_id, user_jwt=user_jwt, document_positions=request.document_positions
+            user_id=user_id, conn=conn, document_positions=request.document_positions
         )
-        logger.info(f"✅ Reordered {len(documents)} documents")
+        logger.info(f"Reordered {len(documents)} documents")
         return {"documents": documents, "count": len(documents)}
     except Exception as e:
         handle_api_exception(e, "Failed to reorder documents", logger)

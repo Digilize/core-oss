@@ -94,12 +94,22 @@ class Settings(BaseSettings):
             origins.extend([o.strip() for o in self.allowed_origins_env.split(",")])
         return origins
     
-    # Supabase settings
+    # Neon DB (replaces Supabase)
+    neon_database_url: str = ""
+
+    # better-auth service URL (for service-to-service calls if needed)
+    better_auth_url: str = "http://localhost:3001"
+
+    # Internal secret for service-to-service calls (e.g., core-auth → core-api)
+    internal_api_secret: str = ""
+
+    # Legacy Supabase settings — kept temporarily for gradual migration,
+    # remove once all Supabase client usage is gone
     supabase_url: str = ""
     supabase_anon_key: str = ""
-    supabase_service_role_key: str = ""  # Service role key for cron jobs and admin operations
-    supabase_jwt_secret: str = ""  # Legacy JWT secret for verifying token signatures
-    
+    supabase_service_role_key: str = ""
+    supabase_jwt_secret: str = ""
+
     # Google OAuth settings (required for Google Calendar sync)
     google_client_id: str = ""
     google_client_secret: str = ""

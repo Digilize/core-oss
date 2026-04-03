@@ -1,68 +1,60 @@
 """
 Board service - CRUD operations for project boards.
 
-Uses async Supabase client for non-blocking I/O.
+Uses asyncpg for non-blocking I/O.
 """
 from typing import Dict, Any, List, Optional
 import logging
-from lib.supabase_client import get_authenticated_async_client
+import asyncpg
 
 logger = logging.getLogger(__name__)
 
 
 async def get_boards(
-    user_jwt: str,
+    conn: asyncpg.Connection,
     workspace_app_id: str,
 ) -> List[Dict[str, Any]]:
     """
     Get all boards for a workspace app, ordered by position.
 
     Args:
-        user_jwt: User's Supabase JWT
+        conn: asyncpg connection
         workspace_app_id: Workspace app ID (projects app)
 
     Returns:
         List of board dicts
     """
-    supabase = await get_authenticated_async_client(user_jwt)
-
-    result = await supabase.table("project_boards")\
-        .select("*")\
-        .eq("workspace_app_id", workspace_app_id)\
-        .order("position")\
-        .execute()
-
-    return result.data or []
+    rows = await conn.fetch(
+        "SELECT * FROM project_boards WHERE workspace_app_id = $1 ORDER BY position",
+        workspace_app_id,
+    )
+    return [dict(r) for r in rows]
 
 
 async def get_board_by_id(
-    user_jwt: str,
+    conn: asyncpg.Connection,
     board_id: str,
 ) -> Optional[Dict[str, Any]]:
     """
     Get a single board by ID.
 
     Args:
-        user_jwt: User's Supabase JWT
+        conn: asyncpg connection
         board_id: Board UUID
 
     Returns:
         Board dict or None
     """
-    supabase = await get_authenticated_async_client(user_jwt)
-
-    result = await supabase.table("project_boards")\
-        .select("*")\
-        .eq("id", board_id)\
-        .maybe_single()\
-        .execute()
-
-    return result.data
+    row = await conn.fetchrow(
+        "SELECT * FROM project_boards WHERE id = $1",
+        board_id,
+    )
+    return dict(row) if row else None
 
 
 async def create_board(
     user_id: str,
-    user_jwt: str,
+    conn: asyncpg.Connection,
     workspace_app_id: str,
     name: str,
     description: Optional[str] = None,
@@ -71,11 +63,11 @@ async def create_board(
     key: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Create a new board with 3 default states (Backlog, In Progress, Done).
+    Create a new board with 3 default states (To Do, In Progress, Done).
 
     Args:
         user_id: Creator's user ID
-        user_jwt: User's Supabase JWT
+        conn: asyncpg connection
         workspace_app_id: Workspace app ID (projects app)
         name: Board name
         description: Optional board description
@@ -86,41 +78,37 @@ async def create_board(
     Returns:
         Dict with board and states data
     """
-    supabase = await get_authenticated_async_client(user_jwt)
-
     # Look up workspace_id from workspace_app
-    app_result = await supabase.table("workspace_apps")\
-        .select("workspace_id")\
-        .eq("id", workspace_app_id)\
-        .single()\
-        .execute()
-    workspace_id = app_result.data["workspace_id"]
+    app_row = await conn.fetchrow(
+        "SELECT workspace_id FROM workspace_apps WHERE id = $1",
+        workspace_app_id,
+    )
+    if not app_row:
+        raise ValueError(f"Workspace app not found: {workspace_app_id}")
+    workspace_id = app_row["workspace_id"]
 
     # Get next position
-    position = await _get_next_board_position(supabase, workspace_app_id)
-
-    # Build board data
-    board_data: Dict[str, Any] = {
-        "workspace_app_id": workspace_app_id,
-        "workspace_id": workspace_id,
-        "name": name,
-        "position": position,
-        "created_by": user_id,
-    }
-    if description is not None:
-        board_data["description"] = description
-    if icon is not None:
-        board_data["icon"] = icon
-    if color is not None:
-        board_data["color"] = color
-    if key is not None:
-        board_data["key"] = key
+    position = await _get_next_board_position(conn, workspace_app_id)
 
     # Insert board
-    board_result = await supabase.table("project_boards")\
-        .insert(board_data)\
-        .execute()
-    board = board_result.data[0]
+    board = await conn.fetchrow(
+        """
+        INSERT INTO project_boards
+            (workspace_app_id, workspace_id, name, description, icon, color, key, position, created_by)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        RETURNING *
+        """,
+        workspace_app_id,
+        workspace_id,
+        name,
+        description,
+        icon,
+        color,
+        key,
+        position,
+        user_id,
+    )
+    board = dict(board)
 
     # Create default states
     default_states = [
@@ -129,33 +117,35 @@ async def create_board(
         {"name": "Done", "color": "#10B981", "position": 2, "is_done": True},
     ]
 
-    states_data = [
-        {
-            "workspace_app_id": workspace_app_id,
-            "workspace_id": workspace_id,
-            "board_id": board["id"],
-            "name": s["name"],
-            "color": s["color"],
-            "position": s["position"],
-            "is_done": s["is_done"],
-        }
-        for s in default_states
-    ]
-
-    states_result = await supabase.table("project_states")\
-        .insert(states_data)\
-        .execute()
+    states = []
+    for s in default_states:
+        state_row = await conn.fetchrow(
+            """
+            INSERT INTO project_states
+                (workspace_app_id, workspace_id, board_id, name, color, position, is_done)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            RETURNING *
+            """,
+            workspace_app_id,
+            workspace_id,
+            board["id"],
+            s["name"],
+            s["color"],
+            s["position"],
+            s["is_done"],
+        )
+        states.append(dict(state_row))
 
     logger.info(f"Created board '{name}' with 3 default states for workspace app {workspace_app_id}")
 
     return {
         "board": board,
-        "states": states_result.data or [],
+        "states": states,
     }
 
 
 async def update_board(
-    user_jwt: str,
+    conn: asyncpg.Connection,
     board_id: str,
     name: Optional[str] = None,
     description: Optional[str] = None,
@@ -167,7 +157,7 @@ async def update_board(
     Update a board's fields.
 
     Args:
-        user_jwt: User's Supabase JWT
+        conn: asyncpg connection
         board_id: Board UUID
         name: New name (optional)
         description: New description (optional)
@@ -178,8 +168,6 @@ async def update_board(
     Returns:
         Updated board dict
     """
-    supabase = await get_authenticated_async_client(user_jwt)
-
     updates: Dict[str, Any] = {}
     if name is not None:
         updates["name"] = name
@@ -194,39 +182,45 @@ async def update_board(
 
     if not updates:
         # Nothing to update, just return current board
-        return await get_board_by_id(user_jwt, board_id)  # type: ignore
+        return await get_board_by_id(conn, board_id)  # type: ignore
 
-    result = await supabase.table("project_boards")\
-        .update(updates)\
-        .eq("id", board_id)\
-        .execute()
+    # Build SET clause dynamically
+    set_parts = []
+    values = []
+    for i, (col, val) in enumerate(updates.items(), start=1):
+        set_parts.append(f"{col} = ${i}")
+        values.append(val)
+    values.append(board_id)
 
-    if not result.data:
+    row = await conn.fetchrow(
+        f"UPDATE project_boards SET {', '.join(set_parts)} WHERE id = ${len(values)} RETURNING *",
+        *values,
+    )
+
+    if not row:
         raise ValueError(f"Board not found: {board_id}")
 
-    return result.data[0]
+    return dict(row)
 
 
 async def delete_board(
-    user_jwt: str,
+    conn: asyncpg.Connection,
     board_id: str,
 ) -> Dict[str, Any]:
     """
     Delete a board (cascades to states and issues).
 
     Args:
-        user_jwt: User's Supabase JWT
+        conn: asyncpg connection
         board_id: Board UUID
 
     Returns:
         Status dict
     """
-    supabase = await get_authenticated_async_client(user_jwt)
-
-    await supabase.table("project_boards")\
-        .delete()\
-        .eq("id", board_id)\
-        .execute()
+    await conn.execute(
+        "DELETE FROM project_boards WHERE id = $1",
+        board_id,
+    )
 
     logger.info(f"Deleted board {board_id}")
 
@@ -234,17 +228,14 @@ async def delete_board(
 
 
 async def _get_next_board_position(
-    supabase: Any,
+    conn: asyncpg.Connection,
     workspace_app_id: str,
 ) -> int:
     """Get the next position for a new board in the workspace app."""
-    result = await supabase.table("project_boards")\
-        .select("position")\
-        .eq("workspace_app_id", workspace_app_id)\
-        .order("position", desc=True)\
-        .limit(1)\
-        .execute()
-
-    if result.data:
-        return result.data[0]["position"] + 1
+    row = await conn.fetchrow(
+        "SELECT position FROM project_boards WHERE workspace_app_id = $1 ORDER BY position DESC LIMIT 1",
+        workspace_app_id,
+    )
+    if row:
+        return row["position"] + 1
     return 0

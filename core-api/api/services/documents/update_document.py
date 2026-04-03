@@ -1,8 +1,8 @@
 """Service for updating documents."""
 from typing import Optional, List
 import asyncio
+import asyncpg
 from fastapi import HTTPException, status
-from lib.supabase_client import get_authenticated_async_client
 from api.services.notifications.file_edits import emit_document_edited_notification
 import logging
 
@@ -65,7 +65,7 @@ def _should_snapshot(
 
 
 async def _snapshot_version_async(
-    user_jwt: str,
+    conn: asyncpg.Connection,
     document_id: str,
     old_title: str,
     old_content: str,
@@ -83,47 +83,40 @@ async def _snapshot_version_async(
     Failures are intentionally non-blocking to keep save latency stable.
     """
     try:
-        auth_supabase = await get_authenticated_async_client(user_jwt)
-
-        insert_result = await (
-            auth_supabase.rpc(
-                "insert_document_version_snapshot",
-                {
-                    "p_document_id": document_id,
-                    "p_title": old_title,
-                    "p_content": old_content,
-                    "p_created_by": user_id,
-                    "p_force": force,
-                },
-            )
-            .execute()
+        insert_row = await conn.fetchrow(
+            "SELECT * FROM insert_document_version_snapshot($1, $2, $3, $4, $5)",
+            document_id,
+            old_title,
+            old_content,
+            user_id,
+            force,
         )
 
-        if not insert_result.data:
+        if not insert_row:
             # RPC returned no rows — interval gate rejected the snapshot.
             logger.info("[version] %s: skipped by RPC (interval not met)", document_id)
             return False
 
-        version_number = insert_result.data[0].get("version_number")
+        version_number = insert_row.get("version_number")
         logger.info("[version] %s: saved v%s%s", document_id, version_number, " (forced)" if force else "")
 
         # Keep at most 50 versions per document (best effort).
         try:
-            cutoff_result = await (
-                auth_supabase.table("document_versions")
-                .select("id")
-                .eq("document_id", document_id)
-                .order("version_number", desc=True)
-                .range(50, 150)
-                .execute()
+            old_rows = await conn.fetch(
+                """
+                SELECT id FROM document_versions
+                WHERE document_id = $1
+                ORDER BY version_number DESC
+                OFFSET 50
+                LIMIT 100
+                """,
+                document_id,
             )
-            if cutoff_result.data:
-                old_ids = [row["id"] for row in cutoff_result.data]
-                await (
-                    auth_supabase.table("document_versions")
-                    .delete()
-                    .in_("id", old_ids)
-                    .execute()
+            if old_rows:
+                old_ids = [r["id"] for r in old_rows]
+                await conn.execute(
+                    "DELETE FROM document_versions WHERE id = ANY($1::uuid[])",
+                    old_ids,
                 )
                 logger.info("[version] %s: pruned %d old versions", document_id, len(old_ids))
         except Exception as prune_exc:
@@ -148,7 +141,7 @@ async def _snapshot_version_async(
 
 async def _process_document_change_async(
     *,
-    user_jwt: str,
+    conn: asyncpg.Connection,
     document_id: str,
     old_title: str,
     old_content: str,
@@ -164,7 +157,7 @@ async def _process_document_change_async(
     """Run non-blocking versioning and notification side effects for a save."""
     if should_snapshot:
         await _snapshot_version_async(
-            user_jwt=user_jwt,
+            conn=conn,
             document_id=document_id,
             old_title=old_title,
             old_content=old_content,
@@ -195,7 +188,7 @@ async def _process_document_change_async(
 
 async def update_document(
     user_id: str,
-    user_jwt: str,
+    conn: asyncpg.Connection,
     document_id: str,
     title: Optional[str] = None,
     content: Optional[str] = None,
@@ -215,7 +208,7 @@ async def update_document(
 
     Args:
         user_id: ID of the user performing the update
-        user_jwt: User's Supabase JWT for authenticated requests
+        conn: Authenticated asyncpg connection (RLS already set for this user)
         document_id: Document ID to update
         title: New title (optional)
         content: New content (optional)
@@ -235,75 +228,82 @@ async def update_document(
     Returns:
         The updated document record
     """
-    auth_supabase = await get_authenticated_async_client(user_jwt)
-
     try:
-        # Build update data
-        update_data = {}
+        # Build SET clause dynamically
+        set_parts: List[str] = []
+        params: List = []
+
+        def _p(val) -> str:
+            params.append(val)
+            return f"${len(params)}"
 
         if title is not None:
-            update_data["title"] = title
+            set_parts.append(f"title = {_p(title)}")
         if content is not None:
-            update_data["content"] = content
+            set_parts.append(f"content = {_p(content)}")
         if icon is not None:
-            update_data["icon"] = icon
+            set_parts.append(f"icon = {_p(icon)}")
         if cover_image is not None:
-            update_data["cover_image"] = cover_image
-        # Handle parent_id specially - if explicitly set, include it even if None
+            set_parts.append(f"cover_image = {_p(cover_image)}")
         if parent_id_explicitly_set:
-            update_data["parent_id"] = parent_id
+            set_parts.append(f"parent_id = {_p(parent_id)}")
         elif parent_id is not None:
-            update_data["parent_id"] = parent_id
+            set_parts.append(f"parent_id = {_p(parent_id)}")
         if position is not None:
-            update_data["position"] = position
+            set_parts.append(f"position = {_p(position)}")
         if tags is not None:
-            update_data["tags"] = tags
+            set_parts.append(f"tags = {_p(tags)}")
 
-        if not update_data:
+        if not set_parts:
             raise ValueError("No fields to update")
 
         # Read current state once for optimistic locking and version snapshot inputs.
-        current_result = await (
-            auth_supabase.table("documents")
-            .select("title, content, type, updated_at, workspace_id, user_id, file_id")
-            .eq("id", document_id)
-            .limit(1)
-            .execute()
+        current_row = await conn.fetchrow(
+            """
+            SELECT title, content, type, updated_at, workspace_id, user_id, file_id
+            FROM documents
+            WHERE id = $1
+            LIMIT 1
+            """,
+            document_id,
         )
-        if not current_result.data:
+        if not current_row:
             raise Exception("Document not found or access denied")
 
-        current_doc = current_result.data[0]
+        current_doc = dict(current_row)
         old_title = current_doc.get("title") or ""
         old_content = current_doc.get("content") or ""
         doc_type = current_doc.get("type")
         workspace_id = current_doc.get("workspace_id")
-        owner_id = current_doc.get("user_id")
-        file_id = current_doc.get("file_id")
+        owner_id = str(current_doc.get("user_id")) if current_doc.get("user_id") else None
+        file_id = str(current_doc.get("file_id")) if current_doc.get("file_id") else None
 
-        update_query = (
-            auth_supabase.table("documents")
-            .update(update_data)
-            .eq("id", document_id)
-        )
-        # Only enforce optimistic locking when the client explicitly provides
-        # the last-seen updated_at token.
-        optimistic_ts = expected_updated_at
-        if optimistic_ts:
-            update_query = update_query.eq("updated_at", optimistic_ts)
-
-        # Update document - RLS handles authorization (owner or workspace member)
-        result = await update_query.execute()
-
-        if not result.data:
-            exists_result = await (
-                auth_supabase.table("documents")
-                .select("id")
-                .eq("id", document_id)
-                .limit(1)
-                .execute()
+        # Optimistic locking
+        if expected_updated_at:
+            set_parts_str = ", ".join(set_parts)
+            params.append(document_id)
+            id_param = f"${len(params)}"
+            params.append(expected_updated_at)
+            ts_param = f"${len(params)}"
+            updated_row = await conn.fetchrow(
+                f"UPDATE documents SET {set_parts_str} WHERE id = {id_param} AND updated_at = {ts_param} RETURNING id",
+                *params,
             )
-            if exists_result.data:
+        else:
+            set_parts_str = ", ".join(set_parts)
+            params.append(document_id)
+            id_param = f"${len(params)}"
+            updated_row = await conn.fetchrow(
+                f"UPDATE documents SET {set_parts_str} WHERE id = {id_param} RETURNING id",
+                *params,
+            )
+
+        if not updated_row:
+            exists_row = await conn.fetchrow(
+                "SELECT id FROM documents WHERE id = $1 LIMIT 1",
+                document_id,
+            )
+            if exists_row:
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
                     detail="Document changed in another session. Refresh and retry.",
@@ -319,43 +319,60 @@ async def update_document(
             from lib.embed_hooks import embed_document
             embed_document(document_id, new_title, new_content)
 
-        should_snapshot = _should_snapshot(doc_type, old_content, content, force=force_snapshot)
+        should_snap = _should_snapshot(doc_type, old_content, content, force=force_snapshot)
         title_changed = (
             doc_type == "note"
             and title is not None
             and title != old_title
         )
 
-        if should_snapshot or title_changed:
+        if should_snap or title_changed:
             asyncio.create_task(
                 _process_document_change_async(
-                    user_jwt=user_jwt,
+                    conn=conn,
                     document_id=document_id,
                     old_title=old_title,
                     old_content=old_content,
                     new_title=new_title,
                     user_id=user_id,
-                    workspace_id=workspace_id,
+                    workspace_id=str(workspace_id) if workspace_id else None,
                     owner_id=owner_id,
                     file_id=file_id,
-                    should_snapshot=should_snapshot,
+                    should_snapshot=should_snap,
                     title_changed=title_changed,
                     force_snapshot=force_snapshot,
                 )
             )
 
         # Fetch the complete document with file data joined
-        # (UPDATE doesn't support joins in response)
-        full_doc = await (
-            auth_supabase.table("documents")
-            .select("*, file:files(*)")
-            .eq("id", document_id)
-            .execute()
+        full_row = await conn.fetchrow(
+            """
+            SELECT
+                d.*,
+                f.id          AS file__id,
+                f.user_id     AS file__user_id,
+                f.workspace_id AS file__workspace_id,
+                f.workspace_app_id AS file__workspace_app_id,
+                f.filename    AS file__filename,
+                f.file_type   AS file__file_type,
+                f.file_size   AS file__file_size,
+                f.r2_key      AS file__r2_key,
+                f.status      AS file__status,
+                f.created_at  AS file__created_at,
+                f.uploaded_at AS file__uploaded_at
+            FROM documents d
+            LEFT JOIN files f ON f.id = d.file_id
+            WHERE d.id = $1
+            """,
+            document_id,
         )
 
-        if full_doc.data:
-            return full_doc.data[0]
-        return result.data[0]
+        if full_row:
+            from api.services.documents.get_documents import _row_to_doc
+            return _row_to_doc(full_row)
+
+        # Fallback: return minimal dict with just the id
+        return {"id": document_id}
 
     except Exception as e:
         logger.error(f"Error updating document {document_id}: {str(e)}")

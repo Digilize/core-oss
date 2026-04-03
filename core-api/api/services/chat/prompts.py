@@ -6,7 +6,7 @@ import datetime
 import logging
 from typing import Any, Dict, List, Optional
 
-from lib.supabase_client import get_authenticated_async_client
+import asyncpg
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +46,7 @@ def get_datetime_context(user_timezone: str = "UTC") -> Dict[str, str]:
 # User Preferences
 # ============================================================================
 
-async def get_user_preferences(user_id: str, user_jwt: str) -> Dict[str, Any]:
+async def get_user_preferences(user_id: str, conn: asyncpg.Connection) -> Dict[str, Any]:
     """
     Fetch user preferences from database.
     Returns defaults if not found or on error.
@@ -57,11 +57,13 @@ async def get_user_preferences(user_id: str, user_jwt: str) -> Dict[str, Any]:
     }
 
     try:
-        supabase = await get_authenticated_async_client(user_jwt)
-        result = await supabase.table("user_preferences").select("*").eq("user_id", user_id).execute()
+        row = await conn.fetchrow(
+            "SELECT * FROM user_preferences WHERE user_id = $1",
+            user_id,
+        )
 
-        if result.data and len(result.data) > 0:
-            return result.data[0]
+        if row:
+            return dict(row)
 
         return defaults
     except Exception as e:
@@ -201,7 +203,7 @@ def build_context_string(context: Optional[Dict[str, Any]]) -> str:
 
 async def build_system_prompt(
     user_id: str,
-    user_jwt: str,
+    conn: asyncpg.Connection,
     context: Optional[Dict[str, Any]] = None,
     user_timezone: str = "UTC",
     workspace_ids: Optional[List[str]] = None,
@@ -211,7 +213,7 @@ async def build_system_prompt(
 
     Args:
         user_id: User ID
-        user_jwt: User's JWT token for authenticated DB access
+        conn: asyncpg connection for authenticated DB access
         context: Optional context dict with 'emails' and/or 'documents' lists
         user_timezone: User's timezone identifier (e.g., "Europe/Oslo")
         workspace_ids: Optional list of workspace IDs to scope tool results
@@ -223,15 +225,17 @@ async def build_system_prompt(
     dt_ctx = get_datetime_context(user_timezone)
 
     # Fetch user preferences and build behavior instructions
-    preferences = await get_user_preferences(user_id, user_jwt)
+    preferences = await get_user_preferences(user_id, conn)
 
     # Look up workspace names if scoped
     workspace_names: List[str] = []
     if workspace_ids:
         try:
-            supabase = await get_authenticated_async_client(user_jwt)
-            ws_result = await supabase.table("workspaces").select("name").in_("id", workspace_ids).execute()
-            workspace_names = [ws.get("name") for ws in (ws_result.data or []) if ws.get("name")]
+            rows = await conn.fetch(
+                "SELECT name FROM workspaces WHERE id = ANY($1)",
+                workspace_ids,
+            )
+            workspace_names = [r["name"] for r in rows if r.get("name")]
         except Exception as e:
             logger.warning(f"Failed to fetch workspace names for {workspace_ids}: {e}")
     behavior_instructions = build_behavior_instructions(preferences)
@@ -316,7 +320,7 @@ When creating items (documents), associate them with the most relevant workspace
 # This module centralizes all AI behavior configuration. To add new agent logic:
 #
 # 1. ADD A NEW PREFERENCE (if needed):
-#    - Add column to user_preferences table via Supabase migration
+#    - Add column to user_preferences table via migration
 #    - Update iOS UserPreferences.swift and SettingsView.swift
 #    - Update api/routers/preferences.py models
 #

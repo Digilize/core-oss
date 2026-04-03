@@ -15,6 +15,8 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Optional, List, Dict, Any
 
+import asyncpg
+
 from lib.r2_client import R2Client
 from lib.image_proxy import generate_file_url, is_image_type
 from lib.filename_utils import sanitize_filename
@@ -78,14 +80,14 @@ class PresignedUploadManager:
     """
     Orchestrates presigned URL uploads.
 
-    Coordinates between R2 storage and Supabase database.
+    Coordinates between R2 storage and the Neon DB via asyncpg.
     Designed to be reusable across different upload contexts.
     """
 
     def __init__(
         self,
         r2_client: R2Client,
-        supabase_client: Any,
+        conn: asyncpg.Connection,
         max_file_size: Optional[int] = None,
         upload_url_expiry: Optional[int] = None,
     ):
@@ -94,12 +96,12 @@ class PresignedUploadManager:
 
         Args:
             r2_client: R2 storage client
-            supabase_client: Authenticated Supabase client
+            conn: Authenticated asyncpg connection (RLS already set for user)
             max_file_size: Maximum file size in bytes (default: from settings)
             upload_url_expiry: Upload URL validity in seconds (default: from settings)
         """
         self.r2 = r2_client
-        self.db = supabase_client
+        self.conn = conn
         self.max_file_size = max_file_size or settings.r2_max_file_size
         self.upload_url_expiry = upload_url_expiry or settings.r2_upload_url_expiry
 
@@ -151,7 +153,7 @@ class PresignedUploadManager:
 
         return ""
 
-    def _resolve_workspace_id_from_app(self, workspace_app_id: str) -> str:
+    async def _resolve_workspace_id_from_app(self, workspace_app_id: str) -> str:
         """Resolve workspace_id for a workspace_app_id, with short TTL cache."""
         now = time.monotonic()
         cached = _workspace_app_cache.get(workspace_app_id)
@@ -160,25 +162,22 @@ class PresignedUploadManager:
             if workspace_id:
                 return workspace_id
 
-        app_result = (
-            self.db.table("workspace_apps")
-            .select("workspace_id")
-            .eq("id", workspace_app_id)
-            .single()
-            .execute()
+        row = await self.conn.fetchrow(
+            "SELECT workspace_id FROM workspace_apps WHERE id = $1",
+            workspace_app_id,
         )
 
-        if not app_result.data:
+        if not row:
             raise ValueError("Workspace app not found")
 
-        workspace_id = app_result.data["workspace_id"]
+        workspace_id = str(row["workspace_id"])
         _workspace_app_cache[workspace_app_id] = {
             "workspace_id": workspace_id,
             "expires_at": now + _workspace_app_cache_ttl_seconds,
         }
         return workspace_id
 
-    def initiate_upload(
+    async def initiate_upload(
         self,
         user_id: str,
         workspace_app_id: Optional[str] = None,
@@ -233,7 +232,7 @@ class PresignedUploadManager:
                     if cached_workspace_id and cached_workspace_id != workspace_id:
                         raise ValueError("workspace_id does not match workspace_app_id")
         elif workspace_app_id:
-            workspace_id = self._resolve_workspace_id_from_app(workspace_app_id)
+            workspace_id = await self._resolve_workspace_id_from_app(workspace_app_id)
         else:
             raise ValueError("Either workspace_app_id or workspace_id must be provided")
 
@@ -255,29 +254,50 @@ class PresignedUploadManager:
 
         t_presign = time.monotonic()
 
-        # Create file record with status='uploading'
-        file_data = {
-            "user_id": user_id,
-            "workspace_id": workspace_id,
-            "filename": filename,
-            "file_type": content_type,
-            "file_size": file_size,
-            "r2_key": r2_key,
-            "status": UploadStatus.UPLOADING.value,
-        }
-        # Only include workspace_app_id if provided
+        # Build INSERT params
         if workspace_app_id:
-            file_data["workspace_app_id"] = workspace_app_id
+            file_row = await self.conn.fetchrow(
+                """
+                INSERT INTO files
+                    (user_id, workspace_id, workspace_app_id, filename, file_type, file_size, r2_key, status)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                RETURNING *
+                """,
+                user_id,
+                workspace_id,
+                workspace_app_id,
+                filename,
+                content_type,
+                file_size,
+                r2_key,
+                UploadStatus.UPLOADING.value,
+            )
+        else:
+            file_row = await self.conn.fetchrow(
+                """
+                INSERT INTO files
+                    (user_id, workspace_id, filename, file_type, file_size, r2_key, status)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                RETURNING *
+                """,
+                user_id,
+                workspace_id,
+                filename,
+                content_type,
+                file_size,
+                r2_key,
+                UploadStatus.UPLOADING.value,
+            )
 
-        result = self.db.table("files").insert(file_data).execute()
-        file_record = result.data[0]
-        file_id = file_record["id"]
+        if not file_row:
+            raise PresignedUploadError("Failed to create file record")
 
+        file_id = str(file_row["id"])
         public_url = self._generate_public_url(r2_key, content_type)
 
         t_end = time.monotonic()
         logger.info(
-            f"📤 Initiated presigned upload: file_id={file_id} | "
+            f"Initiated presigned upload: file_id={file_id} | "
             f"workspace_lookup={int((t_ws - t_start) * 1000)}ms "
             f"presign={int((t_presign - t_ws) * 1000)}ms "
             f"db_insert={int((t_end - t_presign) * 1000)}ms "
@@ -293,7 +313,7 @@ class PresignedUploadManager:
             headers={"Content-Type": content_type},
         )
 
-    def confirm_upload(
+    async def confirm_upload(
         self,
         file_id: str,
         user_id: str,
@@ -320,16 +340,19 @@ class PresignedUploadManager:
         Raises:
             ValueError: If file not found, wrong owner, or already confirmed
         """
+        import json
+
         t_start = time.monotonic()
 
         try:
-            result = self.db.rpc("confirm_file_upload", {
-                "p_file_id": file_id,
-                "p_create_document": create_document,
-                "p_parent_id": parent_id,
-                "p_tags": tags or [],
-            }).execute()
-        except Exception as e:
+            row = await self.conn.fetchrow(
+                "SELECT confirm_file_upload($1::uuid, $2::boolean, $3::uuid, $4::text[]) AS result",
+                file_id,
+                create_document,
+                parent_id,
+                tags or [],
+            )
+        except asyncpg.PostgresError as e:
             err = str(e)
             if "File not found" in err:
                 raise ValueError("File not found") from e
@@ -343,12 +366,12 @@ class PresignedUploadManager:
 
         t_rpc = time.monotonic()
 
-        if not result.data:
+        if not row or row["result"] is None:
             raise ValueError("File not found")
 
-        rpc_data = result.data
-        if isinstance(rpc_data, list):
-            rpc_data = rpc_data[0] if rpc_data else None
+        rpc_data = row["result"]
+        if isinstance(rpc_data, str):
+            rpc_data = json.loads(rpc_data)
         if not isinstance(rpc_data, dict):
             raise PresignedUploadError("Invalid confirm_file_upload response")
 
@@ -364,52 +387,9 @@ class PresignedUploadManager:
 
         t_end = time.monotonic()
         logger.info(
-            f"✅ Confirmed upload (fast): file_id={file_id} | "
+            f"Confirmed upload (fast): file_id={file_id} | "
             f"rpc={int((t_rpc - t_start) * 1000)}ms "
             f"total={int((t_end - t_start) * 1000)}ms"
         )
 
         return ConfirmUploadResult(file=file_record, document=document)
-
-    def cleanup_orphaned(self, max_age_hours: int = 1) -> int:
-        """
-        Clean up uploads stuck in 'uploading' state.
-
-        Called by cron job. Uses service role to bypass RLS.
-
-        Args:
-            max_age_hours: Delete uploads older than this
-
-        Returns:
-            Number of deleted records
-        """
-        cutoff = (datetime.now(timezone.utc) - timedelta(hours=max_age_hours)).isoformat()
-
-        # Find orphaned uploads
-        result = self.db.table("files") \
-            .select("id, r2_key") \
-            .eq("status", UploadStatus.UPLOADING.value) \
-            .lt("created_at", cutoff) \
-            .execute()
-
-        if not result.data:
-            return 0
-
-        deleted = 0
-        for file in result.data:
-            try:
-                # Delete from R2 (may not exist)
-                try:
-                    self.r2.delete_file(file["r2_key"])
-                except Exception:
-                    pass  # File may not exist in R2
-
-                # Delete from database
-                self.db.table("files").delete().eq("id", file["id"]).execute()
-                deleted += 1
-
-            except Exception as e:
-                logger.error(f"❌ Failed to cleanup orphaned upload {file['id']}: {e}")
-
-        logger.info(f"🧹 Cleaned up {deleted} orphaned uploads")
-        return deleted
