@@ -49,14 +49,17 @@ preprocess_migration() {
     # Strip lines that contain GRANT to Supabase-specific roles
     # Strip lines that contain OWNER TO "postgres" (Neon uses a different owner)
     # Strip lines referencing Supabase-internal schemas for grants
+    # Rewrite Supabase-specific extensions schema function calls to public/default.
     sed \
         -e '/GRANT.*TO "anon"/d' \
         -e '/GRANT.*TO "authenticated"/d' \
+        -e '/GRANT.*TO authenticated/d' \
         -e '/GRANT.*TO "service_role"/d' \
         -e '/OWNER TO "postgres"/d' \
         -e '/OWNER TO "authenticator"/d' \
         -e '/OWNER TO "supabase_admin"/d' \
         -e '/ALTER DEFAULT PRIVILEGES/,/;/d' \
+        -e 's/"extensions"\."uuid_generate_v4"()/"public"."uuid_generate_v4"()/g' \
         "$input" > "$output"
 }
 
@@ -101,14 +104,48 @@ echo "🚀 Running migrations against Neon DB..."
 echo "   Database: ${NEON_DATABASE_URL%%@*}@***"
 echo ""
 
+# Track applied files to support safe reruns on partially migrated databases.
+psql "$NEON_DATABASE_URL" -v ON_ERROR_STOP=1 --single-transaction -c "
+CREATE TABLE IF NOT EXISTS public.neon_migration_history (
+    filename text PRIMARY KEY,
+    applied_at timestamptz NOT NULL DEFAULT now()
+);
+" --quiet >/dev/null
+
 # Run all processed migrations in order
 for migration in $(ls "$PROCESSED_DIR"/*.sql | sort); do
     filename="$(basename "$migration")"
+
+    already_applied="$(
+        psql "$NEON_DATABASE_URL" -tA -v ON_ERROR_STOP=1 \
+            -c "SELECT 1 FROM public.neon_migration_history WHERE filename = '$filename' LIMIT 1;" \
+            --quiet
+    )"
+    if [[ "$already_applied" == "1" ]]; then
+        echo "  ⏭  $filename (already applied)"
+        continue
+    fi
+
     echo "  ▶  $filename"
-    psql "$NEON_DATABASE_URL" -f "$migration" --quiet 2>&1 | grep -v "^$" | sed 's/^/     /' || {
+    # Run each file in a single transaction so partial failures do not leave
+    # half-applied objects that break reruns.
+    if ! psql_output="$(psql "$NEON_DATABASE_URL" -v ON_ERROR_STOP=1 --single-transaction -f "$migration" --quiet 2>&1)"; then
+        # Print psql error output (if any), then fail fast on true psql errors.
+        if [[ -n "$psql_output" ]]; then
+            echo "$psql_output" | sed 's/^/     /'
+        fi
         echo "❌ Failed on $filename"
         exit 1
-    }
+    fi
+
+    # Print non-empty notices/warnings without affecting success.
+    if [[ -n "$psql_output" ]]; then
+        echo "$psql_output" | grep -v "^$" | sed 's/^/     /' || true
+    fi
+
+    psql "$NEON_DATABASE_URL" -v ON_ERROR_STOP=1 --single-transaction \
+        -c "INSERT INTO public.neon_migration_history (filename) VALUES ('$filename');" \
+        --quiet >/dev/null
 done
 
 echo ""

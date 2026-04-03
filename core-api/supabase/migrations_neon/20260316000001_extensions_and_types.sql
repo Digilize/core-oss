@@ -36,7 +36,6 @@ END
 $$;
 
 
-ALTER TYPE "public"."mini_app_type" OWNER TO "postgres";
 
 
 DO $$
@@ -59,7 +58,6 @@ END
 $$;
 
 
-ALTER TYPE "public"."workspace_invitation_status" OWNER TO "postgres";
 
 
 DO $$
@@ -80,7 +78,6 @@ END
 $$;
 
 
-ALTER TYPE "public"."workspace_role" OWNER TO "postgres";
 
 -- =============================================================================
 -- Generic Trigger Function
@@ -96,12 +93,8 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."update_updated_at_column"() OWNER TO "postgres";
 
 -- =============================================================================
 -- GRANTs
 -- =============================================================================
 
-GRANT ALL ON FUNCTION "public"."update_updated_at_column"() TO "anon";
-GRANT ALL ON FUNCTION "public"."update_updated_at_column"() TO "authenticated";
-GRANT ALL ON FUNCTION "public"."update_updated_at_column"() TO "service_role";
